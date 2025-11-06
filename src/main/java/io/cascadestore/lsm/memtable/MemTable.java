@@ -84,6 +84,19 @@ public class MemTable {
     }
   }
 
-  public MemTable() { this(10 * 1024 * 1024); }
-  // constructors and write path land in follow-up commits
+  public MemTable() {
+    this(10 * 1024 * 1024);
+  }
+
+  public MemTable(long maxSizeBytes) {
+    this.entries = new ConcurrentSkipListMap<>();
+    this.allocator = new DirectBufferAllocator();
+    this.sizeBytes = new AtomicLong(0);
+    this.maxSizeBytes = maxSizeBytes;
+    this.immutable = false;
+
+    logger.info("MemTable created with max size: {} bytes", maxSizeBytes);
+  }
+
+  // write path added in a follow-up commit
 }
