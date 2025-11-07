@@ -98,5 +98,33 @@ public class MemTable {
     logger.info("MemTable created with max size: {} bytes", maxSizeBytes);
   }
 
-  // write path added in a follow-up commit
+  public boolean put(byte[] key, byte[] value, long ttlSeconds) {
+    if (immutable) {
+      return false;
+    }
+
+    if (key == null || key.length == 0 || value == null) {
+      return false;
+    }
+
+    ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+    ValueEntry newEntry = new ValueEntry(value, ttlSeconds, false, allocator);
+
+    long entrySize = key.length + newEntry.getSizeBytes();
+
+    if (sizeBytes.get() + entrySize > maxSizeBytes) {
+      return false;
+    }
+
+    ValueEntry oldEntry = entries.put(keyWrapper, newEntry);
+
+    if (oldEntry != null) {
+      sizeBytes.addAndGet(entrySize - oldEntry.getSizeBytes());
+    } else {
+      sizeBytes.addAndGet(entrySize);
+    }
+    return true;
+  }
+
+  // delete path added in a follow-up commit
 }
