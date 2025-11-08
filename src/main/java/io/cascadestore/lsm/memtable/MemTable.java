@@ -126,5 +126,26 @@ public class MemTable {
     return true;
   }
 
-  // delete path added in a follow-up commit
+  public boolean delete(byte[] key) {
+    if (immutable) {
+      return false;
+    }
+
+    if (key == null || key.length == 0) {
+      return false;
+    }
+
+    ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+    ValueEntry tombstone = new ValueEntry(null, 0, true, allocator);
+
+    ValueEntry oldEntry = entries.put(keyWrapper, tombstone);
+
+    if (oldEntry != null) {
+      sizeBytes.addAndGet(-oldEntry.getSizeBytes());
+    }
+    return true;
+  }
+
+
+  // read path added in a follow-up commit
 }
