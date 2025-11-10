@@ -146,6 +146,18 @@ public class MemTable {
     return true;
   }
 
+  public byte[] get(byte[] key) {
+    if (key == null || key.length == 0) {
+      return null;
+    }
 
-  // read path added in a follow-up commit
-}
+    ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+    ValueEntry entry = entries.get(keyWrapper);
+
+    if (entry == null || entry.isExpired() || entry.isTombstone()) {
+      return null;
+    }
+    return entry.getValue();
+  }
+
+  public boolean containsKey(byte[] key) {
