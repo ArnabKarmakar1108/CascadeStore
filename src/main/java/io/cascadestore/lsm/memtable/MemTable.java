@@ -161,3 +161,39 @@ public class MemTable {
   }
 
   public boolean containsKey(byte[] key) {
+    if (key == null || key.length == 0) {
+      return false;
+    }
+
+    ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+    ValueEntry entry = entries.get(keyWrapper);
+
+    return entry != null && !entry.isExpired() && !entry.isTombstone();
+  }
+
+  public Map<ByteArrayWrapper, ValueEntry> getEntries() {
+    return entries;
+  }
+
+  public long getSizeBytes() {
+    return sizeBytes.get();
+  }
+
+  public boolean isFull() {
+    return sizeBytes.get() >= maxSizeBytes;
+  }
+
+  public void makeImmutable() {
+    immutable = true;
+    logger.info("MemTable made immutable with size: {} bytes", sizeBytes.get());
+  }
+
+  public boolean isImmutable() {
+    return immutable;
+  }
+
+  public void close() {
+    allocator.close();
+    logger.info("MemTable closed");
+  }
+}
