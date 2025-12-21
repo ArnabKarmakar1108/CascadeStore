@@ -138,6 +138,67 @@ public class SSTable {
           sstEntry = SSTableEntry.of(key, valueEntry.getValue(), valueEntry.getExpirationTime());
         }
 
+        // Write entry to data file
+        ByteBuffer keyBuffer = ByteBuffer.allocate(4 + key.length);
+        keyBuffer.putInt(key.length);
+        keyBuffer.put(key);
+        keyBuffer.flip();
+        writeDataChannel.write(keyBuffer);
+
+        // Write value or tombstone marker
+        if (valueEntry.isTombstone()) {
+          ByteBuffer tombstoneBuffer =
+              ByteBuffer.allocate(12); // 4 bytes for int + 8 bytes for long
+          tombstoneBuffer.putInt(0); // 0 length indicates tombstone
+          tombstoneBuffer.putLong(valueEntry.getExpirationTime());
+          tombstoneBuffer.flip();
+          writeDataChannel.write(tombstoneBuffer);
+        } else {
+          byte[] value = valueEntry.getValue();
+          ByteBuffer valueBuffer = ByteBuffer.allocate(4 + value.length + 8);
+          valueBuffer.putInt(value.length);
+          valueBuffer.put(value);
+          valueBuffer.putLong(valueEntry.getExpirationTime());
+          valueBuffer.flip();
+          writeDataChannel.write(valueBuffer);
+        }
+
+        // Add to sparse index
+        sparseIndex.put(entry.getKey(), currentOffset);
+
+        // Update offset for next entry
+        currentOffset = writeDataChannel.position();
+      }
+
+      // Write index to index file
+      for (Map.Entry<ByteArrayWrapper, Long> indexEntry : sparseIndex.entrySet()) {
+        byte[] key = indexEntry.getKey().getData();
+        long offset = indexEntry.getValue();
+
+        ByteBuffer indexBuffer = ByteBuffer.allocate(4 + key.length + 8);
+        indexBuffer.putInt(key.length);
+        indexBuffer.put(key);
+        indexBuffer.putLong(offset);
+        indexBuffer.flip();
+
+        writeIndexChannel.write(indexBuffer);
+      }
+    }
+
+    // Save bloom filter to file
+    filter.save(filterFilePath.toString());
+
+    // Load the bloom filter into memory
+    this.bloomFilter = filter;
+
+    // Open the data file for reading
+    this.dataChannel = FileChannel.open(dataFilePath, StandardOpenOption.READ);
+
+    // Open the index file for reading
+    this.indexChannel = FileChannel.open(indexFilePath, StandardOpenOption.READ);
+
+    logger.info("MemTable flushed to SSTable successfully");
+  }
 
   private void loadFromDisk() throws IOException {
     throw new UnsupportedOperationException(
