@@ -201,9 +201,88 @@ public class SSTable {
   }
 
   private void loadFromDisk() throws IOException {
-    throw new UnsupportedOperationException(
-        "load path added in a follow-up commit");
+    logger.info("Loading SSTable from disk");
+
+    // Load the bloom filter
+    if (Files.exists(filterFilePath)) {
+      this.bloomFilter = BloomFilter.load(filterFilePath.toString());
+    } else {
+      logger.warn("Bloom filter file not found: " + filterFilePath);
+      this.bloomFilter = new BloomFilter(1000, 0.01); // Default filter
+    }
+
+    // Load the sparse index
+    if (Files.exists(indexFilePath)) {
+      try (FileChannel indexChannel = FileChannel.open(indexFilePath, StandardOpenOption.READ)) {
+        ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
+
+        while (indexChannel.position() < indexChannel.size()) {
+          // Read key length
+          buffer.clear();
+          buffer.limit(4);
+          indexChannel.read(buffer);
+          buffer.flip();
+          int keyLength = buffer.getInt();
+
+          // Read key
+          buffer.clear();
+          buffer.limit(keyLength);
+          if (buffer.capacity() < keyLength) {
+            buffer = ByteBuffer.allocate(keyLength);
+          }
+          indexChannel.read(buffer);
+          buffer.flip();
+          byte[] key = new byte[keyLength];
+          buffer.get(key);
+
+          // Read offset
+          buffer.clear();
+          buffer.limit(8);
+          indexChannel.read(buffer);
+          buffer.flip();
+          long offset = buffer.getLong();
+
+          // Add to sparse index
+          sparseIndex.put(new ByteArrayWrapper(key), offset);
+        }
+      }
+    } else {
+      logger.warn("Index file not found: " + indexFilePath);
+    }
+
+    // Open the data file for reading
+    if (Files.exists(dataFilePath)) {
+      try {
+        // Open the data file channel
+        dataChannel = FileChannel.open(dataFilePath, StandardOpenOption.READ);
+
+        // Read header
+        ByteBuffer headerBuffer = ByteBuffer.allocate(16);
+        dataChannel.read(headerBuffer, 0);
+        headerBuffer.flip();
+
+        long storedCreationTime = headerBuffer.getLong();
+        int storedLevel = headerBuffer.getInt();
+        int entryCount = headerBuffer.getInt();
+
+        logger.info(
+            "Loaded SSTable with "
+                + entryCount
+                + " entries, level "
+                + storedLevel
+                + ", creation time "
+                + storedCreationTime);
+      } catch (IOException e) {
+        logger.error("Error opening data file", e);
+        throw e;
+      }
+    } else {
+      logger.warn("Data file not found: " + dataFilePath);
+    }
+
+    logger.info("SSTable loaded successfully");
   }
+
 
   // lookup path added in a follow-up commit
 }
