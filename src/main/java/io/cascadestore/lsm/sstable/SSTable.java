@@ -283,6 +283,61 @@ public class SSTable {
     logger.info("SSTable loaded successfully");
   }
 
+  public byte[] get(byte[] key) {
+    if (key == null || key.length == 0 || dataChannel == null) {
+      return null;
+    }
 
-  // lookup path added in a follow-up commit
+    // First check the bloom filter for a quick negative
+    if (bloomFilter != null && !bloomFilter.mightContain(key)) {
+      return null; // Definitely not in the set
+    }
+
+    try {
+      // Find the closest key in the sparse index
+      ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+      Map.Entry<ByteArrayWrapper, Long> indexEntry = sparseIndex.floorEntry(keyWrapper);
+
+      if (indexEntry == null) {
+        // No entry in the sparse index that is less than or equal to the key
+        // Start from the beginning of the data file (after the header)
+        return findKeyInDataFile(key, 16);
+      } else {
+        // Start searching from the position in the sparse index
+        return findKeyInDataFile(key, indexEntry.getValue());
+      }
+    } catch (IOException e) {
+      logger.error("Error reading from SSTable", e);
+      return null;
+    }
+  }
+
+  private byte[] findKeyInDataFile(byte[] key, long startPosition) throws IOException {
+    ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
+    long position = startPosition;
+
+    while (position < dataChannel.size()) {
+      // Read key length
+      buffer.clear();
+      buffer.limit(4);
+      dataChannel.read(buffer, position);
+      buffer.flip();
+      int keyLength = buffer.getInt();
+      position += 4;
+
+      // Read key
+      buffer.clear();
+      buffer.limit(keyLength);
+      if (buffer.capacity() < keyLength) {
+        buffer = ByteBuffer.allocate(keyLength);
+      }
+      dataChannel.read(buffer, position);
+      buffer.flip();
+      byte[] entryKey = new byte[keyLength];
+      buffer.get(entryKey);
+      position += keyLength;
+
+      // Read value length
+
+  // lifecycle methods added in a follow-up commit
 }
