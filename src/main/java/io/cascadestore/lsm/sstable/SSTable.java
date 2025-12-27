@@ -338,6 +338,102 @@ public class SSTable {
       position += keyLength;
 
       // Read value length
+      buffer.clear();
+      buffer.limit(4);
+      dataChannel.read(buffer, position);
+      buffer.flip();
+      int valueLength = buffer.getInt();
+      position += 4;
 
-  // lifecycle methods added in a follow-up commit
+      // Check if this is a tombstone
+      if (valueLength == 0) {
+        // Skip the timestamp (8 bytes)
+        position += 8;
+
+        // If this is the key we're looking for, it's been deleted
+        if (Arrays.equals(key, entryKey)) {
+          return null;
+        }
+
+        continue;
+      }
+
+      // Read value
+      buffer.clear();
+      buffer.limit(valueLength);
+      if (buffer.capacity() < valueLength) {
+        buffer = ByteBuffer.allocate(valueLength);
+      }
+      dataChannel.read(buffer, position);
+      buffer.flip();
+      byte[] value = new byte[valueLength];
+      buffer.get(value);
+      position += valueLength;
+
+      // Skip the timestamp (8 bytes)
+      position += 8;
+
+      // If this is the key we're looking for, return the value
+      if (Arrays.equals(key, entryKey)) {
+        return value;
+      }
+    }
+    // Key not found
+    return null;
+  }
+
+  public boolean mightContain(byte[] key) {
+    return bloomFilter != null && bloomFilter.mightContain(key);
+  }
+
+  public int getLevel() {
+    return level;
+  }
+
+  public long getSequenceNumber() {
+    return sequenceNumber;
+  }
+
+  public long getCreationTime() {
+    return creationTime;
+  }
+
+  public long getSizeBytes() {
+    long size = 0;
+
+    try {
+      File dataFile = dataFilePath.toFile();
+      File indexFile = indexFilePath.toFile();
+      File filterFile = filterFilePath.toFile();
+
+      if (dataFile.exists()) size += dataFile.length();
+      if (indexFile.exists()) size += indexFile.length();
+      if (filterFile.exists()) size += filterFile.length();
+    } catch (Exception e) {
+      logger.warn("Error getting SSTable size", e);
+    }
+
+    return size;
+  }
+
+  public void close() {
+    try {
+      if (dataChannel != null && dataChannel.isOpen()) {
+        dataChannel.close();
+      }
+      if (indexChannel != null && indexChannel.isOpen()) {
+        indexChannel.close();
+      }
+      if (bloomFilter != null) {
+        bloomFilter.close();
+      }
+
+      logger.info("SSTable closed: " + dataFilePath);
+    } catch (IOException e) {
+      logger.warn("Error closing SSTable resources", e);
+    }
+  }
+
+
+  // range scan added in a follow-up commit
 }
