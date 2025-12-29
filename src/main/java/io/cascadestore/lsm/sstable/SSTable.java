@@ -434,6 +434,197 @@ public class SSTable {
     }
   }
 
+  public boolean delete() {
+    boolean success = true;
 
-  // range scan added in a follow-up commit
+    try {
+      // Close first to release resources
+      close();
+
+      // Delete files
+      File dataFile = dataFilePath.toFile();
+      File indexFile = indexFilePath.toFile();
+      File filterFile = filterFilePath.toFile();
+
+      if (dataFile.exists() && !dataFile.delete()) {
+        success = false;
+      }
+      if (indexFile.exists() && !indexFile.delete()) {
+        success = false;
+      }
+      if (filterFile.exists() && !filterFile.delete()) {
+        success = false;
+      }
+    } catch (Exception e) {
+      logger.warn("Error deleting SSTable files", e);
+      success = false;
+    }
+
+    return success;
+  }
+
+  public List<byte[]> listKeys() {
+    List<byte[]> keys = new ArrayList<>();
+
+    try {
+      // Scan the data file to get all keys
+      if (dataChannel != null && dataChannel.isOpen()) {
+        // Start after the header
+        long position = 16;
+        ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
+
+        while (position < dataChannel.size()) {
+          // Read key length
+          buffer.clear();
+          buffer.limit(4);
+          dataChannel.read(buffer, position);
+          buffer.flip();
+          int keyLength = buffer.getInt();
+          position += 4;
+
+          // Read key
+          buffer.clear();
+          buffer.limit(keyLength);
+          if (buffer.capacity() < keyLength) {
+            buffer = ByteBuffer.allocate(keyLength);
+          }
+          dataChannel.read(buffer, position);
+          buffer.flip();
+          byte[] key = new byte[keyLength];
+          buffer.get(key);
+          position += keyLength;
+
+          // Read value length
+          buffer.clear();
+          buffer.limit(4);
+          dataChannel.read(buffer, position);
+          buffer.flip();
+          int valueLength = buffer.getInt();
+          position += 4;
+
+          // Skip tombstones
+          if (valueLength == 0) {
+            // Skip the timestamp (8 bytes)
+            position += 8;
+            continue;
+          }
+
+          // Add the key to the list
+          keys.add(key);
+
+          // Skip the value and timestamp
+          position += valueLength + 8;
+        }
+      }
+
+      return keys;
+    } catch (Exception e) {
+      logger.error("Error listing keys from SSTable", e);
+      return keys;
+    }
+  }
+
+  public int countEntries() {
+    try {
+      // This is a simplified implementation that assumes the sparse index contains all keys
+      // A more complete implementation would scan the data file and count all entries
+      return sparseIndex.size();
+    } catch (Exception e) {
+      logger.error("Error counting entries in SSTable", e);
+      return 0;
+    }
+  }
+
+  public Map<byte[], byte[]> getRange(byte[] startKey, byte[] endKey) {
+    Map<byte[], byte[]> result =
+        new TreeMap<>(
+            (a, b) -> {
+              ByteArrayWrapper wrapperA = new ByteArrayWrapper(a);
+              ByteArrayWrapper wrapperB = new ByteArrayWrapper(b);
+              return wrapperA.compareTo(wrapperB);
+            });
+
+    try {
+      ByteArrayWrapper startWrapper = startKey != null ? new ByteArrayWrapper(startKey) : null;
+      ByteArrayWrapper endWrapper = endKey != null ? new ByteArrayWrapper(endKey) : null;
+
+      // Scan the data file to get all keys in the range
+      if (dataChannel != null && dataChannel.isOpen()) {
+        // Start after the header
+        long position = 16;
+        ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
+
+        while (position < dataChannel.size()) {
+          // Read key length
+          buffer.clear();
+          buffer.limit(4);
+          dataChannel.read(buffer, position);
+          buffer.flip();
+          int keyLength = buffer.getInt();
+          position += 4;
+
+          // Read key
+          buffer.clear();
+          buffer.limit(keyLength);
+          if (buffer.capacity() < keyLength) {
+            buffer = ByteBuffer.allocate(keyLength);
+          }
+          dataChannel.read(buffer, position);
+          buffer.flip();
+          byte[] key = new byte[keyLength];
+          buffer.get(key);
+          position += keyLength;
+
+          // Check if the key is in the range
+          ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+          boolean inRange = true;
+          if (startWrapper != null && keyWrapper.compareTo(startWrapper) < 0) {
+            inRange = false; // Key is before the start of the range
+          }
+          if (endWrapper != null && keyWrapper.compareTo(endWrapper) >= 0) {
+            inRange = false; // Key is at or after the end of the range
+          }
+
+          // Read value length
+          buffer.clear();
+          buffer.limit(4);
+          dataChannel.read(buffer, position);
+          buffer.flip();
+          int valueLength = buffer.getInt();
+          position += 4;
+
+          // Skip tombstones
+          if (valueLength == 0) {
+            // Skip the timestamp (8 bytes)
+            position += 8;
+            continue;
+          }
+
+          // If the key is in the range, add it to the result
+          if (inRange) {
+            // Read value
+            buffer.clear();
+            buffer.limit(valueLength);
+            if (buffer.capacity() < valueLength) {
+              buffer = ByteBuffer.allocate(valueLength);
+            }
+            dataChannel.read(buffer, position);
+            buffer.flip();
+            byte[] value = new byte[valueLength];
+            buffer.get(value);
+
+            result.put(key, value);
+          }
+
+          // Skip the value (if we didn't read it) and timestamp
+          position += valueLength + 8;
+        }
+      }
+
+      return result;
+    } catch (Exception e) {
+      logger.error("Error getting range from SSTable", e);
+      return result;
+    }
+  }
 }
