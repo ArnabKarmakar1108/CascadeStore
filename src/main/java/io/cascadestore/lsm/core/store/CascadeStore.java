@@ -175,19 +175,48 @@ public class CascadeStore implements Storage {
     }
   }
 
+  private void switchMemTable() {
+    memTableLock.writeLock().lock();
+    try {
+      activeMemTable.makeImmutable();
+      synchronized (immutableMemTables) {
+        immutableMemTables.add(activeMemTable);
+      }
+      activeMemTable = new MemTable(config.memTableMaxSizeBytes());
+      getStore.updateDependencies(activeMemTable, immutableMemTables, ssTables, memTableLock);
+      putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
+      logger.info("Switched to new MemTable, old one scheduled for flushing");
+    } finally {
+      memTableLock.writeLock().unlock();
+    }
+  }
+
   @Override
   public boolean put(byte[] key, byte[] value, long ttlSeconds) {
-    throw new UnsupportedOperationException("put() added in a follow-up commit");
+    int result = putStore.put(key, value, ttlSeconds);
+    if (result == PutStore.RESULT_SUCCESS) {
+      return true;
+    } else if (result == PutStore.RESULT_MEMTABLE_FULL) {
+      switchMemTable();
+      putStore = new PutStore(activeMemTable, memTableLock, wal, recovering);
+      int newResult = putStore.put(key, value, ttlSeconds);
+      return newResult == PutStore.RESULT_SUCCESS;
+    }
+    return false;
   }
 
   @Override
   public boolean put(byte[] key, byte[] value) {
-    throw new UnsupportedOperationException("put() added in a follow-up commit");
+    return put(key, value, 0);
   }
 
   @Override
   public byte[] get(byte[] key) {
-    throw new UnsupportedOperationException("get() added in a follow-up commit");
+    int result = getStore.get(key);
+    if (result == GetStore.RESULT_SUCCESS) {
+      return getStore.getRetrievedValue();
+    }
+    return null;
   }
 
   @Override
