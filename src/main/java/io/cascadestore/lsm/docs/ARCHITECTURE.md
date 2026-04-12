@@ -98,5 +98,105 @@ A fast, sorted, in-memory write buffer using off-heap storage for values.
 | Field          | Type                                                  | Purpose                                |
 | -------------- | ----------------------------------------------------- | -------------------------------------- |
 | `entries`      | `ConcurrentSkipListMap<ByteArrayWrapper, ValueEntry>` | Sorted key-to-value map                |
+| `allocator`    | `OffHeapAllocator`                                    | Manages off-heap ByteBuffer allocation |
+| `sizeBytes`    | `AtomicLong`                                          | Tracks total memory usage              |
+| `maxSizeBytes` | `long`                                                | Capacity limit (default 10MB)          |
+| `immutable`    | `volatile boolean`                                    | Once set, rejects all writes           |
+
+
+
+
+### ValueEntry — Off-Heap ByteBuffer Layout
+
+```
+Offset  0-7  (8 bytes): expirationTime (long) — 0 = no expiration
+Offset  8    (1 byte):  tombstone flag — 0x01 = deleted, 0x00 = live
+Offset  9-11 (3 bytes): padding
+Offset 12-15 (4 bytes): valueLength (int) — 0 for tombstones
+Offset 16+   (N bytes): value data
+```
+
+**HEADER_SIZE = 16 bytes.** All access uses absolute-position ByteBuffer methods (thread-safe for concurrent reads).
+
+### DirectBufferAllocator
+
+- `ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())`
+- Tracks all buffers in a synchronized list
+- `close()` invokes `sun.misc.Unsafe.invokeCleaner(buffer)` for deterministic deallocation
+- Falls back to GC if Unsafe unavailable
+
+
+
+### Lifecycle
+
+1. Created mutable with `maxSizeBytes` capacity
+2. Accepts `put()` / `delete()` (delete inserts a tombstone)
+3. Returns `false` from `put()` when full
+4. `makeImmutable()` — volatile write; all subsequent writes rejected
+5. `close()` — frees all off-heap memory
+
+---
+
+
+
+## 4. WAL (Write-Ahead Log)
+
+
+
+### Binary Record Format
+
+**Put Record:**
+
+```
+[1 byte: type=0x01][8 bytes: seqNum][4 bytes: keyLen][N bytes: key]
+[4 bytes: valueLen][M bytes: value][8 bytes: ttlSeconds]
+```
+
+**Delete Record:**
+
+```
+[1 byte: type=0x02][8 bytes: seqNum][4 bytes: keyLen][N bytes: key]
+```
+
+
+
+### Components
+
+
+| Class            | Responsibility                                                    |
+| ---------------- | ----------------------------------------------------------------- |
+| `WAL`            | Interface: append, read, delete                                   |
+| `WALImpl`        | Facade composing Manager + Reader + Writer                        |
+| `WALWriterImpl`  | Serializes records, writes via FileChannel, fsyncs. Synchronized. |
+| `WALReaderImpl`  | Sequential binary read from WAL files                             |
+| `WALManagerImpl` | File lifecycle: create, rotate at 64MB, discover, delete          |
+| `WALFileImpl`    | FileChannel wrapper for a single WAL file                         |
+| `PutRecord`      | Immutable record with key (cloned), value (cloned), ttl, seqNum   |
+| `DeleteRecord`   | Immutable record with key (cloned), seqNum                        |
+
+
+
+
+### File Management
+
+- Directory: `<dataDirectory>/wal/`
+- Naming: `wal_%020d.log` (zero-padded sequence number)
+- Rotation: at 64MB file size
+- Sequence numbers: global `AtomicLong`, monotonically increasing
+
+---
+
+
+
+## 5. SSTable
+
+
+
+### On-Disk Format
+
+Each SSTable produces three files: `sst_L<level>_S<seqNum>.{data,index,filter}`
+
+**Data File (.data):**
+
 
 <!-- remaining sections land in a follow-up commit -->
