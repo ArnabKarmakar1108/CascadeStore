@@ -198,5 +198,105 @@ Each SSTable produces three files: `sst_L<level>_S<seqNum>.{data,index,filter}`
 
 **Data File (.data):**
 
+```
+[Header: 16 bytes]
+  8 bytes: creationTime (long)
+  4 bytes: level (int)
+  4 bytes: entryCount (int)
+[Entries...]
+  4 bytes: keyLength
+  N bytes: key
+  4 bytes: valueLength (0 = tombstone)
+  M bytes: value (if not tombstone)
+  8 bytes: timestamp
+```
+
+**Index File (.index):**
+
+```
+[Entries — sparse index, one per key]
+  4 bytes: keyLength
+  N bytes: key
+  8 bytes: offset into data file
+```
+
+**Filter File (.filter):**
+
+```
+4 bytes: numHashFunctions
+remaining: bloom filter bit array
+```
+
+
+
+### Class Hierarchy
+
+
+| Class              | Role                                                              |
+| ------------------ | ----------------------------------------------------------------- |
+| `SSTable`          | Concrete class used by CascadeStore; handles flush + load + query |
+| `SSTableInterface` | Interface for modular implementation                              |
+| `SSTableImpl`      | Modular implementation delegating to component managers           |
+| `SSTableAdapter`   | Adapts SSTableInterface to extend SSTable (Adapter pattern)       |
+| `SSTableFactory`   | Factory for creating SSTables (modular or backward-compatible)    |
+| `SSTableEntry`     | Immutable record for a single entry                               |
+| `SSTableIterator`  | Sealed interface with InMemory and File implementations           |
+
+
+
+
+### BloomFilter
+
+- Off-heap bit array via `DirectBufferAllocator`
+- Hash: `h = 31 * h + b` with seed = function index
+- Optimal bits: `-(n * ln(p)) / (ln(2)^2)`
+- Optimal hash functions: `max(1, round(m/n * ln(2)))`
+
+
+
+### Lookup Path (SSTable.get)
+
+1. `bloomFilter.mightContain(key)` — false → key definitely absent
+2. `sparseIndex.floorEntry(key)` — find closest offset
+3. Sequential scan from that offset in .data file
+
+---
+
+
+
+## 6. Compaction
+
+
+
+### CompactionStrategy Interface
+
+```java
+boolean shouldCompact(List<SSTable> ssTables);
+List<SSTable> selectTableToCompact(List<SSTable> ssTables);
+int getCompactionOutputLevel(List<SSTable> tablesToCompact);
+String getName();
+```
+
+
+
+### ThresholdCompactionStrategy
+
+- **Trigger:** `ssTables.size() >= compactionThreshold` (default 4)
+- **Selection:** Groups by level, picks level with most SSTables (requires >= 2)
+- **Output:** `currentLevel + 1`
+
+
+
+### SizeTieredCompactionStrategy
+
+- **Trigger:** Any size bucket has >= `minThreshold` (4) SSTables
+- **Bucketing:** `bucketLow * avg <= size <= bucketHigh * avg` (0.5x to 1.5x)
+- **Selection:** Largest qualifying bucket, capped at `maxThreshold` (32)
+- **Output:** `max(levels in selected) + 1`
+
+
+
+### CompactionService Flow
+
 
 <!-- remaining sections land in a follow-up commit -->
