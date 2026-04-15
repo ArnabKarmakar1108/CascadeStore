@@ -312,6 +312,43 @@ public class SSTable {
     }
   }
 
+  /** Smallest key in this SSTable, derived from the sparse index. */
+  public byte[] getMinKey() {
+    if (sparseIndex.isEmpty()) {
+      return null;
+    }
+    return sparseIndex.firstKey().getData();
+  }
+
+  /** Largest key in this SSTable, derived from the sparse index. */
+  public byte[] getMaxKey() {
+    if (sparseIndex.isEmpty()) {
+      return null;
+    }
+    return sparseIndex.lastKey().getData();
+  }
+
+  /** Returns true when this table's key range intersects {@code other}'s range. */
+  public boolean overlaps(SSTable other) {
+    if (other == null) {
+      return false;
+    }
+    return keyRangesOverlap(
+        getMinKey(), getMaxKey(), other.getMinKey(), other.getMaxKey());
+  }
+
+  public static boolean keyRangesOverlap(
+      byte[] minA, byte[] maxA, byte[] minB, byte[] maxB) {
+    if (minA == null || maxA == null || minB == null || maxB == null) {
+      return false;
+    }
+    ByteArrayWrapper minAw = new ByteArrayWrapper(minA);
+    ByteArrayWrapper maxAw = new ByteArrayWrapper(maxA);
+    ByteArrayWrapper minBw = new ByteArrayWrapper(minB);
+    ByteArrayWrapper maxBw = new ByteArrayWrapper(maxB);
+    return minAw.compareTo(maxBw) <= 0 && minBw.compareTo(maxAw) <= 0;
+  }
+
   private byte[] findKeyInDataFile(byte[] key, long startPosition) throws IOException {
     ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
     long position = startPosition;

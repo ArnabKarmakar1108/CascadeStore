@@ -194,6 +194,43 @@ class SSTableTest {
   }
 
   @Test
+  void testKeyBoundsAfterFlush() throws IOException {
+    ssTable = new SSTable(memTable, tempDir.toString(), 0, 1);
+
+    assertArrayEquals("key1".getBytes(), ssTable.getMinKey());
+    assertArrayEquals("key4".getBytes(), ssTable.getMaxKey());
+  }
+
+  @Test
+  void testKeyBoundsAfterReload() throws IOException {
+    SSTable original = new SSTable(memTable, tempDir.toString(), 0, 1);
+    original.close();
+
+    ssTable = new SSTable(tempDir.toString(), 0, 1);
+
+    assertArrayEquals("key1".getBytes(), ssTable.getMinKey());
+    assertArrayEquals("key4".getBytes(), ssTable.getMaxKey());
+  }
+
+  @Test
+  void testKeyRangeOverlap() throws IOException {
+    MemTable lowKeys = new MemTable(1024);
+    lowKeys.put("a-key".getBytes(), "v".getBytes(), 0);
+    MemTable highKeys = new MemTable(1024);
+    highKeys.put("m-key".getBytes(), "v".getBytes(), 0);
+
+    SSTable low = new SSTable(lowKeys, tempDir.toString(), 0, 1);
+    SSTable high = new SSTable(highKeys, tempDir.toString(), 0, 2);
+
+    assertFalse(low.overlaps(high));
+
+    lowKeys.close();
+    highKeys.close();
+    low.close();
+    high.close();
+  }
+
+  @Test
   void testDelete() throws IOException {
     // Create an SSTable from the MemTable
     ssTable = new SSTable(memTable, tempDir.toString(), 0, 1);
