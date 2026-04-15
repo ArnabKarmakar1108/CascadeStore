@@ -79,7 +79,7 @@ io.cascadestore.lsm
 └── core/
     ├── store/            CascadeStore, PutStore, GetStore, DeleteStore
     ├── backgroundservice/ FlushService, CompactionService, CleanupService
-    └── compaction/       CompactionStrategy, Threshold, SizeTiered
+    └── compaction/       CompactionStrategy, Threshold, SizeTiered, LevelTiered
 ```
 
 ---
@@ -260,6 +260,12 @@ remaining: bloom filter bit array
 2. `sparseIndex.floorEntry(key)` — find closest offset
 3. Sequential scan from that offset in .data file
 
+### Key Bounds (compaction)
+
+- `getMinKey()` / `getMaxKey()` — first and last keys from the sparse index
+- `overlaps(other)` — true when key ranges intersect
+- `keyRangesOverlap(minA, maxA, minB, maxB)` — static range overlap check used by level-tiered selection
+
 ---
 
 
@@ -296,7 +302,132 @@ String getName();
 
 
 
+### LevelTieredCompactionStrategy
+
+Leveled compaction with adjacent-level merges. Strategy parameters are set on the constructor (defaults shown below), not on `CascadeConfig`.
+
+| Parameter | Default | Purpose |
+| --------- | ------- | ------- |
+| `l0CompactionTrigger` | 4 | L0 file count that triggers compaction |
+| `maxL0CompactionFiles` | 4 | Max L0 SSTables picked per L0 job |
+| `baseLevelSizeBytes` | 10 MB | Byte budget for L1 |
+| `levelSizeMultiplier` | 10 | Each deeper level budget = previous × multiplier |
+| `maxLevels` | 7 | Cap on level number |
+
+- **Trigger (L0):** `count(L0) >= l0CompactionTrigger`
+- **Trigger (L1+):** Total bytes at level *n* ≥ level budget for *n*
+- **Selection (L0):** Up to `maxL0CompactionFiles` oldest L0 SSTables by sequence number, plus all overlapping L1 SSTables (expanded until stable)
+- **Selection (L1+):** Largest SSTable at over-budget level *n*, plus all overlapping SSTables at level *n+1*
+- **Output:** Any job that includes L0 inputs → level 1; pure L*n* jobs → level *n+1* (capped at `maxLevels`)
+- **Scheduling:** One adjacent-level merge per compaction tick (no cascade loop in a single job)
+
+
+
 ### CompactionService Flow
 
+1. `compactionStrategy.shouldCompact()` check
+2. `selectTableToCompact()` picks tables
+3. Create merge MemTable with capacity `max(memTableMaxSizeBytes × 10, inputBytes × 1.2)`
+4. Parallel reads from selected SSTables (cached thread pool)
+5. Merge: newer SSTables win (descending seqNum order); tombstones dropped
+6. Load merged entries into MemTable; abort without deleting inputs if full
+7. Write merged data into new SSTable at output level
+8. Remove old SSTables from list, delete files
+9. **Merge safety:** Abort without deleting inputs on MemTable overflow or `OutOfMemoryError`
 
-<!-- remaining sections land in a follow-up commit -->
+---
+
+
+
+## 7. Background Services
+
+
+| Service             | Schedule    | Responsibility                                |
+| ------------------- | ----------- | --------------------------------------------- |
+| `FlushService`      | Every 10s   | Flush immutable MemTables to level-0 SSTables |
+| `CompactionService` | Every 30min | Merge SSTables per configured strategy        |
+| `CleanupService`    | Every 1min  | Remove expired (TTL) entries from MemTables   |
+
+
+All extend `AbstractBackgroundService`:
+
+- Single daemon thread per service (`CascadeStore-<name>`)
+- `ScheduledExecutorService.scheduleAtFixedRate()`
+- Graceful shutdown: 5s await → `shutdownNow()`
+
+---
+
+
+
+## 8. Store Layer
+
+
+
+### CascadeStore
+
+The main entry point implementing `Storage`. Owns all components.
+
+
+| Field                | Type                     | Purpose              |
+| -------------------- | ------------------------ | -------------------- |
+| `activeMemTable`     | `MemTable`               | Current write target |
+| `immutableMemTables` | `List<MemTable>`         | Pending flush        |
+| `ssTables`           | `List<SSTable>`          | On-disk tables       |
+| `wal`                | `WAL`                    | Durability           |
+| `memTableLock`       | `ReentrantReadWriteLock` | Concurrency control  |
+| `sequenceNumber`     | `AtomicLong`             | Global ordering      |
+| `recovering`         | `AtomicBoolean`          | WAL replay mode      |
+
+
+
+
+### Operation Delegates
+
+
+| Class         | Path                                             |
+| ------------- | ------------------------------------------------ |
+| `PutStore`    | WAL append → MemTable insert                     |
+| `GetStore`    | Active MemTable → Immutable MemTables → SSTables |
+| `DeleteStore` | Existence check → WAL append → tombstone insert  |
+
+
+---
+
+
+
+## 9. Configuration (CascadeConfig)
+
+
+| Field                       | Default     | Purpose                             |
+| --------------------------- | ----------- | ----------------------------------- |
+| `memTableMaxSizeBytes`      | 10MB        | MemTable capacity before flush      |
+| `dataDirectory`             | `"./data"`  | Root for all persistent files       |
+| `compactionThreshold`       | 4           | SSTable count triggering compaction |
+| `compactionIntervalMinutes` | 30          | Background compaction interval      |
+| `cleanupIntervalMinutes`    | 1           | TTL cleanup interval                |
+| `flushIntervalSeconds`      | 10          | Background flush interval           |
+| `compactionStrategyType`    | `THRESHOLD` | Compaction strategy                 |
+
+
+Immutable Java record with `with*()` builder methods.
+
+---
+
+
+
+## 10. API Layer
+
+
+
+### Storage Interface
+
+```java
+put(key, value) / put(key, value, ttl)
+get(key)
+delete(key)
+listKeys() / containsKey(key) / size()
+getRange(start, end)
+getIterator(start, end)
+clear() / shutdown()
+```
+
