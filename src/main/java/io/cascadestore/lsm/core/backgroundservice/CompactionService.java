@@ -4,6 +4,7 @@ import io.cascadestore.lsm.api.ByteArrayWrapper;
 import io.cascadestore.lsm.config.CascadeConfig;
 import io.cascadestore.lsm.core.compaction.CompactionStrategy;
 import io.cascadestore.lsm.core.compaction.CompactionStrategyType;
+import io.cascadestore.lsm.core.compaction.LevelTieredCompactionStrategy;
 import io.cascadestore.lsm.core.compaction.SizeTieredCompactionStrategy;
 import io.cascadestore.lsm.core.compaction.ThresholdCompactionStrategy;
 import io.cascadestore.lsm.memtable.MemTable;
@@ -43,6 +44,7 @@ public class CompactionService extends AbstractBackgroundService {
     return switch (strategyType) {
       case THRESHOLD -> new ThresholdCompactionStrategy(config);
       case SIZE_TIERED -> new SizeTieredCompactionStrategy(config);
+      case LEVEL_TIERED -> new LevelTieredCompactionStrategy(config);
     };
   }
 
