@@ -19,6 +19,7 @@ public class MemTable {
   private final AtomicLong sizeBytes;
   private final long maxSizeBytes;
   private volatile boolean immutable;
+  private volatile boolean atCapacity;
 
   public static class ValueEntry {
     private static final int HEADER_SIZE = 16;
@@ -113,6 +114,7 @@ public class MemTable {
     long entrySize = key.length + newEntry.getSizeBytes();
 
     if (sizeBytes.get() + entrySize > maxSizeBytes) {
+      atCapacity = true;
       return false;
     }
 
@@ -180,7 +182,7 @@ public class MemTable {
   }
 
   public boolean isFull() {
-    return sizeBytes.get() >= maxSizeBytes;
+    return atCapacity || sizeBytes.get() >= maxSizeBytes;
   }
 
   public void makeImmutable() {
