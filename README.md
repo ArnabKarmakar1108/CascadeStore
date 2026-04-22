@@ -30,7 +30,7 @@ Primary components:
 
 - **Write-optimized path**: Batches mutations in memory before sequential disk writes.
 - **Ordered storage**: Keys remain sorted for efficient range scans and iterators.
-- **Background compaction**: Threshold-based or size-tiered policies merge SSTables automatically.
+- **Background compaction**: Threshold, size-tiered, or level-tiered policies merge SSTables automatically.
 - **TTL entries**: Optional expiration timestamps on individual keys.
 - **Tombstones**: Explicit delete markers propagate through flush and compaction.
 - **Bloom filters**: Off-heap filters short-circuit negative lookups before disk I/O.
@@ -128,12 +128,25 @@ storage.put("key".getBytes(), "value".getBytes(), 60);
 
 ### Compaction tuning
 
+CascadeStore supports three compaction strategies via `CompactionStrategyType`:
+
+- **THRESHOLD** — compact when a level accumulates enough SSTables (default).
+- **SIZE_TIERED** — group similarly sized SSTables and merge them.
+- **LEVEL_TIERED** — L0 count trigger plus per-level byte budgets; L0 jobs include overlapping L1 files so deeper levels stay non-overlapping.
+
 ```java
 Storage storage = new CascadeStore(
     10 * 1024 * 1024,
     "./data",
     4,
     CompactionStrategyType.SIZE_TIERED
+);
+
+Storage levelTiered = new CascadeStore(
+    10 * 1024 * 1024,
+    "./data",
+    4,
+    CompactionStrategyType.LEVEL_TIERED
 );
 
 CascadeConfig config = new CascadeConfig(
