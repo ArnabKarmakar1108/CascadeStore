@@ -29,7 +29,7 @@ public class SizeTieredCompactionStrategy implements CompactionStrategy {
   public SizeTieredCompactionStrategy(CascadeConfig config) {
     this(
         config,
-        DEFAULT_MIN_THRESHOLD,
+        config.compactionThreshold(),
         DEFAULT_MAX_THRESHOLD,
         DEFAULT_BUCKET_LOW,
         DEFAULT_BUCKET_HIGH);

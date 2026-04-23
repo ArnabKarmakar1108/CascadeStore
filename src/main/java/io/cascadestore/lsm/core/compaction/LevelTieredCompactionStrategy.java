@@ -33,8 +33,8 @@ public class LevelTieredCompactionStrategy implements CompactionStrategy {
   public LevelTieredCompactionStrategy(CascadeConfig config) {
     this(
         config,
-        DEFAULT_L0_COMPACTION_TRIGGER,
-        DEFAULT_MAX_L0_COMPACTION_FILES,
+        config.compactionThreshold(),
+        config.compactionThreshold(),
         DEFAULT_BASE_LEVEL_SIZE_BYTES,
         DEFAULT_LEVEL_SIZE_MULTIPLIER,
         DEFAULT_MAX_LEVELS);
