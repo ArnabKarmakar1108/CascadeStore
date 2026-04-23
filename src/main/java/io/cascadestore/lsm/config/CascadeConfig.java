@@ -1,12 +1,13 @@
 package io.cascadestore.lsm.config;
 
 import io.cascadestore.lsm.core.compaction.CompactionStrategyType;
+import java.util.concurrent.TimeUnit;
 
 public record CascadeConfig(
     int memTableMaxSizeBytes,
     String dataDirectory,
     int compactionThreshold,
-    int compactionIntervalMinutes,
+    double compactionIntervalMinutes,
     int cleanupIntervalMinutes,
     int flushIntervalSeconds,
     CompactionStrategyType compactionStrategyType) {
@@ -34,6 +35,28 @@ public record CascadeConfig(
       throw new IllegalArgumentException("compactionStrategyType must not be null");
     }
   }
+
+  /**
+   * Compaction schedule derived from {@link #compactionIntervalMinutes()}.
+   *
+   * <p>Values {@code >= 1} are minutes ({@code 30} = 30 min, {@code 10} = 10 min). Values
+   * {@code < 1} are seconds ({@code 0.5} = 1 s after clamping).
+   */
+  public CompactionInterval compactionInterval() {
+    long periodSeconds;
+    if (compactionIntervalMinutes >= 1.0) {
+      periodSeconds = Math.max(1L, Math.round(compactionIntervalMinutes * 60.0));
+    } else {
+      periodSeconds = Math.max(1L, Math.round(compactionIntervalMinutes));
+    }
+
+    long initialDelay = compactionIntervalMinutes >= 1.0
+        ? Math.min(30L, Math.max(1L, periodSeconds / 3L))
+        : Math.max(1L, periodSeconds / 3L);
+    return new CompactionInterval(initialDelay, periodSeconds, TimeUnit.SECONDS);
+  }
+
+  public record CompactionInterval(long initialDelay, long period, TimeUnit unit) {}
 
   public static CascadeConfig getDefault() {
     return new CascadeConfig(
@@ -73,7 +96,7 @@ public record CascadeConfig(
         this.compactionStrategyType);
   }
 
-  public CascadeConfig withCompactionIntervalMinutes(int compactionIntervalMinutes) {
+  public CascadeConfig withCompactionIntervalMinutes(double compactionIntervalMinutes) {
     return new CascadeConfig(
         this.memTableMaxSizeBytes,
         this.dataDirectory,

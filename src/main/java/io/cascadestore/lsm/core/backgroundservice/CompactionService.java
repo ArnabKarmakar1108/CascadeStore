@@ -53,7 +53,8 @@ public class CompactionService extends AbstractBackgroundService {
 
   @Override
   public void start() {
-    scheduleTask(30, config.compactionIntervalMinutes(), TimeUnit.MINUTES);
+    CascadeConfig.CompactionInterval interval = config.compactionInterval();
+    scheduleTask(interval.initialDelay(), interval.period(), interval.unit());
   }
 
   @Override
