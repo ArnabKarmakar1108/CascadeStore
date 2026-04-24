@@ -142,6 +142,33 @@ class SSTableTest {
   }
 
   @Test
+  void testGetRangeWithLargeValues() throws IOException {
+    // YCSB record payloads exceed the default 1024-byte read buffer
+    byte[] largeValue = new byte[1100];
+    Arrays.fill(largeValue, (byte) 'x');
+
+    MemTable largeMemTable = new MemTable(64 * 1024);
+    largeMemTable.put("large-key".getBytes(), largeValue, 0);
+
+    ssTable = new SSTable(largeMemTable, tempDir.toString(), 0, 42);
+    largeMemTable.close();
+
+    Map<byte[], byte[]> range = ssTable.getRange(null, null);
+
+    assertEquals(1, range.size());
+    byte[] readValue =
+        range.entrySet().stream()
+            .filter(e -> Arrays.equals(e.getKey(), "large-key".getBytes()))
+            .map(Map.Entry::getValue)
+            .findFirst()
+            .orElse(null);
+    assertNotNull(readValue);
+    assertArrayEquals(largeValue, readValue);
+    assertArrayEquals(largeValue, ssTable.get("large-key".getBytes()));
+    assertEquals(1, ssTable.listKeys().size());
+  }
+
+  @Test
   void testListKeys() throws IOException {
     // Create an SSTable from the MemTable
     ssTable = new SSTable(memTable, tempDir.toString(), 0, 1);

@@ -1,6 +1,7 @@
 package io.cascadestore.lsm.sstable.data;
 
 import io.cascadestore.lsm.api.ByteArrayWrapper;
+import io.cascadestore.lsm.io.ReadBuffers;
 import io.cascadestore.lsm.sstable.SSTableEntry;
 import io.cascadestore.lsm.sstable.io.SSTableIO;
 import java.io.IOException;
@@ -108,11 +109,8 @@ public class DataFileManagerImpl implements DataFileManager {
       position += 4;
 
       // Read key
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
       buffer.limit(keyLength);
-      if (buffer.capacity() < keyLength) {
-        buffer = ByteBuffer.allocate(keyLength);
-      }
       channel.read(buffer, position);
       buffer.flip();
       byte[] entryKey = new byte[keyLength];
@@ -120,7 +118,7 @@ public class DataFileManagerImpl implements DataFileManager {
       position += keyLength;
 
       // Read value length
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, 4);
       buffer.limit(4);
       channel.read(buffer, position);
       buffer.flip();
@@ -141,11 +139,8 @@ public class DataFileManagerImpl implements DataFileManager {
       }
 
       // Read value
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, valueLength);
       buffer.limit(valueLength);
-      if (buffer.capacity() < valueLength) {
-        buffer = ByteBuffer.allocate(valueLength);
-      }
       channel.read(buffer, position);
       buffer.flip();
       byte[] value = new byte[valueLength];
@@ -189,11 +184,8 @@ public class DataFileManagerImpl implements DataFileManager {
       position += 4;
 
       // Read key
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
       buffer.limit(keyLength);
-      if (buffer.capacity() < keyLength) {
-        buffer = ByteBuffer.allocate(keyLength);
-      }
       channel.read(buffer, position);
       buffer.flip();
       byte[] key = new byte[keyLength];
@@ -211,7 +203,7 @@ public class DataFileManagerImpl implements DataFileManager {
       }
 
       // Read value length
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, 4);
       buffer.limit(4);
       channel.read(buffer, position);
       buffer.flip();
@@ -228,11 +220,8 @@ public class DataFileManagerImpl implements DataFileManager {
       // If the key is in the range, add it to the result
       if (inRange) {
         // Read value
-        buffer.clear();
+        buffer = ReadBuffers.ensureCapacity(buffer, valueLength);
         buffer.limit(valueLength);
-        if (buffer.capacity() < valueLength) {
-          buffer = ByteBuffer.allocate(valueLength);
-        }
         channel.read(buffer, position);
         buffer.flip();
         byte[] value = new byte[valueLength];
@@ -266,11 +255,8 @@ public class DataFileManagerImpl implements DataFileManager {
       position += 4;
 
       // Read key
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
       buffer.limit(keyLength);
-      if (buffer.capacity() < keyLength) {
-        buffer = ByteBuffer.allocate(keyLength);
-      }
       channel.read(buffer, position);
       buffer.flip();
       byte[] key = new byte[keyLength];
@@ -278,7 +264,7 @@ public class DataFileManagerImpl implements DataFileManager {
       position += keyLength;
 
       // Read value length
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, 4);
       buffer.limit(4);
       channel.read(buffer, position);
       buffer.flip();

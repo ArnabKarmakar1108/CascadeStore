@@ -9,6 +9,7 @@ import io.cascadestore.lsm.sstable.SSTable;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
@@ -99,5 +100,32 @@ class CompactionServiceTest {
     assertNotNull(compactedTable.get("key2".getBytes()));
     assertNotNull(compactedTable.get("key3".getBytes()));
     assertNotNull(compactedTable.get("key4".getBytes()));
+  }
+
+  @Test
+  void testCompactionWithLargeValues() throws IOException {
+    byte[] largeValue = new byte[1100];
+    Arrays.fill(largeValue, (byte) 'y');
+
+    MemTable memTable1 = new MemTable(config.memTableMaxSizeBytes());
+    memTable1.put("key1".getBytes(), largeValue, 0);
+
+    MemTable memTable2 = new MemTable(config.memTableMaxSizeBytes());
+    memTable2.put("key2".getBytes(), largeValue, 0);
+
+    SSTable ssTable1 =
+        new SSTable(memTable1, config.dataDirectory(), 0, sequenceNumber.getAndIncrement());
+    SSTable ssTable2 =
+        new SSTable(memTable2, config.dataDirectory(), 0, sequenceNumber.getAndIncrement());
+
+    ssTables.add(ssTable1);
+    ssTables.add(ssTable2);
+
+    compactionService.executeNow();
+
+    assertEquals(1, ssTables.size());
+    SSTable compactedTable = ssTables.get(0);
+    assertArrayEquals(largeValue, compactedTable.get("key1".getBytes()));
+    assertArrayEquals(largeValue, compactedTable.get("key2".getBytes()));
   }
 }

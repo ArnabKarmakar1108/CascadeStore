@@ -1,5 +1,6 @@
 package io.cascadestore.lsm.wal;
 
+import io.cascadestore.lsm.io.ReadBuffers;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -257,18 +258,15 @@ public class WriteAheadLog implements AutoCloseable {
 
           // Read the key
           byte[] key = new byte[keyLength];
-          buffer.clear();
+          buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
           buffer.limit(keyLength);
-          if (buffer.capacity() < keyLength) {
-            buffer = ByteBuffer.allocate(keyLength);
-          }
           channel.read(buffer);
           buffer.flip();
           buffer.get(key);
 
           if (recordType == PUT_RECORD) {
             // Read the value length
-            buffer.clear();
+            buffer = ReadBuffers.ensureCapacity(buffer, 4);
             buffer.limit(4);
             channel.read(buffer);
             buffer.flip();
@@ -276,17 +274,14 @@ public class WriteAheadLog implements AutoCloseable {
 
             // Read the value
             byte[] value = new byte[valueLength];
-            buffer.clear();
+            buffer = ReadBuffers.ensureCapacity(buffer, valueLength);
             buffer.limit(valueLength);
-            if (buffer.capacity() < valueLength) {
-              buffer = ByteBuffer.allocate(valueLength);
-            }
             channel.read(buffer);
             buffer.flip();
             buffer.get(value);
 
             // Read the TTL
-            buffer.clear();
+            buffer = ReadBuffers.ensureCapacity(buffer, 8);
             buffer.limit(8);
             channel.read(buffer);
             buffer.flip();

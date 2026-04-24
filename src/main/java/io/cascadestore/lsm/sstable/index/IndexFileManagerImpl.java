@@ -1,6 +1,7 @@
 package io.cascadestore.lsm.sstable.index;
 
 import io.cascadestore.lsm.api.ByteArrayWrapper;
+import io.cascadestore.lsm.io.ReadBuffers;
 import io.cascadestore.lsm.sstable.io.SSTableIO;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -89,11 +90,8 @@ public class IndexFileManagerImpl implements IndexFileManager {
       int keyLength = buffer.getInt();
 
       // Read key
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
       buffer.limit(keyLength);
-      if (buffer.capacity() < keyLength) {
-        buffer = ByteBuffer.allocate(keyLength);
-      }
       channel.read(buffer);
       buffer.flip();
       byte[] key = new byte[keyLength];

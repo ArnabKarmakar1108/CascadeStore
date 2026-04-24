@@ -1,6 +1,7 @@
 package io.cascadestore.lsm.sstable;
 
 import io.cascadestore.lsm.api.ByteArrayWrapper;
+import io.cascadestore.lsm.io.ReadBuffers;
 import io.cascadestore.lsm.memtable.MemTable;
 import java.io.File;
 import java.io.IOException;
@@ -225,11 +226,8 @@ public class SSTable {
           int keyLength = buffer.getInt();
 
           // Read key
-          buffer.clear();
+          buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
           buffer.limit(keyLength);
-          if (buffer.capacity() < keyLength) {
-            buffer = ByteBuffer.allocate(keyLength);
-          }
           indexChannel.read(buffer);
           buffer.flip();
           byte[] key = new byte[keyLength];
@@ -363,11 +361,8 @@ public class SSTable {
       position += 4;
 
       // Read key
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
       buffer.limit(keyLength);
-      if (buffer.capacity() < keyLength) {
-        buffer = ByteBuffer.allocate(keyLength);
-      }
       dataChannel.read(buffer, position);
       buffer.flip();
       byte[] entryKey = new byte[keyLength];
@@ -375,7 +370,7 @@ public class SSTable {
       position += keyLength;
 
       // Read value length
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, 4);
       buffer.limit(4);
       dataChannel.read(buffer, position);
       buffer.flip();
@@ -396,11 +391,8 @@ public class SSTable {
       }
 
       // Read value
-      buffer.clear();
+      buffer = ReadBuffers.ensureCapacity(buffer, valueLength);
       buffer.limit(valueLength);
-      if (buffer.capacity() < valueLength) {
-        buffer = ByteBuffer.allocate(valueLength);
-      }
       dataChannel.read(buffer, position);
       buffer.flip();
       byte[] value = new byte[valueLength];
@@ -520,11 +512,8 @@ public class SSTable {
           position += 4;
 
           // Read key
-          buffer.clear();
+          buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
           buffer.limit(keyLength);
-          if (buffer.capacity() < keyLength) {
-            buffer = ByteBuffer.allocate(keyLength);
-          }
           dataChannel.read(buffer, position);
           buffer.flip();
           byte[] key = new byte[keyLength];
@@ -532,7 +521,7 @@ public class SSTable {
           position += keyLength;
 
           // Read value length
-          buffer.clear();
+          buffer = ReadBuffers.ensureCapacity(buffer, 4);
           buffer.limit(4);
           dataChannel.read(buffer, position);
           buffer.flip();
@@ -601,11 +590,8 @@ public class SSTable {
           position += 4;
 
           // Read key
-          buffer.clear();
+          buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
           buffer.limit(keyLength);
-          if (buffer.capacity() < keyLength) {
-            buffer = ByteBuffer.allocate(keyLength);
-          }
           dataChannel.read(buffer, position);
           buffer.flip();
           byte[] key = new byte[keyLength];
@@ -623,7 +609,7 @@ public class SSTable {
           }
 
           // Read value length
-          buffer.clear();
+          buffer = ReadBuffers.ensureCapacity(buffer, 4);
           buffer.limit(4);
           dataChannel.read(buffer, position);
           buffer.flip();
@@ -640,11 +626,8 @@ public class SSTable {
           // If the key is in the range, add it to the result
           if (inRange) {
             // Read value
-            buffer.clear();
+            buffer = ReadBuffers.ensureCapacity(buffer, valueLength);
             buffer.limit(valueLength);
-            if (buffer.capacity() < valueLength) {
-              buffer = ByteBuffer.allocate(valueLength);
-            }
             dataChannel.read(buffer, position);
             buffer.flip();
             byte[] value = new byte[valueLength];
