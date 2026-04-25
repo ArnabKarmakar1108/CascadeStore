@@ -21,6 +21,7 @@
         <slf4j.version>2.0.7</slf4j.version>
         <mockito.version>5.3.1</mockito.version>
         <jmh.version>1.36</jmh.version>
+        <ycsb.version>0.17.0</ycsb.version>
     </properties>
 
     <dependencies>
@@ -84,6 +85,14 @@
             <version>${jmh.version}</version>
             <scope>test</scope>
         </dependency>
+
+        <!-- YCSB macro benchmark binding -->
+        <dependency>
+            <groupId>site.ycsb</groupId>
+            <artifactId>core</artifactId>
+            <version>${ycsb.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -109,6 +118,18 @@
                         <exclude>**/it/**</exclude>
                     </excludes>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.3.0</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

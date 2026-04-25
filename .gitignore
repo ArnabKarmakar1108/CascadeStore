@@ -113,3 +113,6 @@ buildNumber.properties
 .project
 # JDT-specific (Eclipse Java Development Tools)
 .classpath
+
+# Local YCSB checkout (cloned by scripts/ycsb-env.sh)
+.ycsb/
