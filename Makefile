@@ -72,6 +72,25 @@ test-stress:
 test-it:
 	$(MAVEN) test -Dtest="io.cascadestore.lsm.it.**"
 
+# YCSB macro benchmark (requires Java + Maven; clones YCSB on first run)
+.PHONY: ycsb-dryrun ycsb-matrix-dryrun
+ycsb-dryrun:
+	./scripts/run-ycsb.sh all workloada-dryrun LEVEL_TIERED
+
+ycsb-matrix-dryrun:
+	./scripts/run-ycsb-matrix.sh workloada-dryrun
+
+.PHONY: ycsb-workloada ycsb-workloada-compaction
+ycsb-workloada:
+	THREADS=1 RECORDCOUNT=100000 OPERATIONCOUNT=100000 MEMTABLE_MB=256 \
+		./scripts/run-ycsb-matrix.sh workloada 100000 100000
+
+ycsb-workloada-compaction:
+	./scripts/run-ycsb-compaction-matrix.sh
+
+ycsb-workloada-ladder:
+	./scripts/run-ycsb-scale-ladder.sh
+
 # Run all excluded tests
 .PHONY: test-all-excluded
 test-all-excluded: test-benchmark test-smoke test-stress test-it
@@ -88,6 +107,11 @@ help:
 	@echo "  test-smoke       - Run smoke tests"
 	@echo "  test-stress      - Run stress tests"
 	@echo "  test-it          - Run integration tests"
+	@echo "  ycsb-dryrun      - YCSB Workload A dry-run (load + run, LEVEL_TIERED)"
+	@echo "  ycsb-matrix-dryrun - YCSB dry-run for all three compaction strategies"
+	@echo "  ycsb-workloada     - Workload A 100k, single-thread, baseline profile"
+	@echo "  ycsb-workloada-compaction - Workload A 100k, single-thread, compaction profile"
+	@echo "  ycsb-workloada-ladder    - Workload A 10k + 100k × 3 strategies"
 	@echo "  test-all-excluded - Run all excluded tests"
 	@echo "  package          - Package the project"
 	@echo "  install          - Install the project"
