@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import io.cascadestore.lsm.memtable.MemTable;
 import io.cascadestore.lsm.sstable.SSTable;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Map;
@@ -200,7 +201,6 @@ class SSTableTest {
 
   @Test
   void testOpenExistingSSTable() throws IOException {
-    // Create an SSTable from the MemTable
     SSTable originalSSTable = new SSTable(memTable, tempDir.toString(), 0, 1);
 
     // Close the original SSTable
@@ -218,6 +218,20 @@ class SSTableTest {
     byte[] value1 = ssTable.get("key1".getBytes());
     assertNotNull(value1);
     assertArrayEquals("value1".getBytes(), value1);
+  }
+
+  @Test
+  void testReloadWithoutBloomFilterRebuildsFromData() throws IOException {
+    SSTable original = new SSTable(memTable, tempDir.toString(), 0, 1);
+    original.close();
+
+    Files.delete(tempDir.resolve("sst_L0_S1.filter"));
+
+    ssTable = new SSTable(tempDir.toString(), 0, 1);
+
+    assertNotNull(ssTable.get("key1".getBytes()));
+    assertNotNull(ssTable.get("key2".getBytes()));
+    assertNull(ssTable.get("key4".getBytes()));
   }
 
   @Test
@@ -255,6 +269,31 @@ class SSTableTest {
     highKeys.close();
     low.close();
     high.close();
+  }
+
+  @Test
+  void testSparseIndexUsesDataBlocks() throws IOException {
+    MemTable large = new MemTable(64 * 1024 * 1024);
+    byte[] value = new byte[1024];
+    try {
+      for (int i = 0; i < 500; i++) {
+        String key = String.format("key%05d", i);
+        assertTrue(large.put(key.getBytes(), value, 0));
+      }
+
+      ssTable = new SSTable(large, tempDir.toString(), 0, 1);
+
+      long indexBytes = Files.size(tempDir.resolve("sst_L0_S1.index"));
+      assertTrue(indexBytes < 500L * 20, "index should be much smaller than one entry per key");
+      assertEquals(500, ssTable.countEntries());
+
+      for (int i = 0; i < 500; i += 17) {
+        String key = String.format("key%05d", i);
+        assertNotNull(ssTable.get(key.getBytes()), "key must remain reachable via sparse index");
+      }
+    } finally {
+      large.close();
+    }
   }
 
   @Test

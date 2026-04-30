@@ -1,7 +1,13 @@
 package io.cascadestore.lsm.sstable;
 
 import io.cascadestore.lsm.api.ByteArrayWrapper;
+import io.cascadestore.lsm.io.BlockCache;
+import io.cascadestore.lsm.io.BufferedDataReader;
+import io.cascadestore.lsm.io.MappedDataFile;
 import io.cascadestore.lsm.io.ReadBuffers;
+import io.cascadestore.lsm.io.ValueBufferPool;
+import io.cascadestore.lsm.sstable.index.SparseIndex;
+import io.cascadestore.lsm.sstable.index.SparseIndexPolicy;
 import io.cascadestore.lsm.memtable.MemTable;
 import java.io.File;
 import java.io.IOException;
@@ -14,8 +20,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,9 +36,11 @@ public class SSTable {
   // File channels for data access
   private FileChannel dataChannel;
   private FileChannel indexChannel;
+  private MappedDataFile mappedDataFile;
+  private final ThreadLocal<BufferedDataReader> threadLocalDataReader = new ThreadLocal<>();
 
   // Sparse index for efficient lookups
-  private final NavigableMap<ByteArrayWrapper, Long> sparseIndex;
+  private SparseIndex sparseIndex;
 
   // Bloom filter for efficient negative lookups
   private BloomFilter bloomFilter;
@@ -41,13 +49,25 @@ public class SSTable {
   private final long creationTime;
   private final int level;
   private final long sequenceNumber;
+  private int entryCount;
+
+  private final AtomicInteger pinCount = new AtomicInteger(0);
+  private volatile boolean retired;
+  private final BlockCache blockCache;
 
   public SSTable(MemTable memTable, String directory, int level, long sequenceNumber)
       throws IOException {
+    this(memTable, directory, level, sequenceNumber, null);
+  }
+
+  public SSTable(
+      MemTable memTable, String directory, int level, long sequenceNumber, BlockCache blockCache)
+      throws IOException {
+    this.blockCache = blockCache;
     this.creationTime = System.currentTimeMillis();
     this.level = level;
     this.sequenceNumber = sequenceNumber;
-    this.sparseIndex = new TreeMap<>();
+    this.sparseIndex = SparseIndex.empty();
 
     // Create directory if it doesn't exist
     File dir = new File(directory);
@@ -61,16 +81,25 @@ public class SSTable {
     this.indexFilePath = Path.of(directory, filePrefix + ".index");
     this.filterFilePath = Path.of(directory, filePrefix + ".filter");
 
-    // Flush MemTable to disk
-    flushToDisk(memTable);
-
-    logger.info("Created SSTable: " + filePrefix);
+    try {
+      flushToDisk(memTable);
+      logger.info("Created SSTable: {}", filePrefix);
+    } catch (IOException e) {
+      deleteFiles(directory, level, sequenceNumber);
+      throw e;
+    }
   }
 
   public SSTable(String directory, int level, long sequenceNumber) throws IOException {
+    this(directory, level, sequenceNumber, null);
+  }
+
+  public SSTable(String directory, int level, long sequenceNumber, BlockCache blockCache)
+      throws IOException {
+    this.blockCache = blockCache;
     this.level = level;
     this.sequenceNumber = sequenceNumber;
-    this.sparseIndex = new TreeMap<>();
+    this.sparseIndex = SparseIndex.empty();
 
     // Define file paths
     String filePrefix = String.format("sst_L%d_S%d", level, sequenceNumber);
@@ -91,7 +120,7 @@ public class SSTable {
     logger.info("Flushing MemTable to disk as SSTable");
 
     // Create a bloom filter for efficient negative lookups
-    BloomFilter filter = new BloomFilter(memTable.getEntries().size(), 0.01);
+    BloomFilter filter = new BloomFilter(memTable.getEntries().size(), BloomFilter.DEFAULT_FALSE_POSITIVE_RATE);
 
     // Create data and index files
     try (FileChannel writeDataChannel =
@@ -108,54 +137,58 @@ public class SSTable {
                 StandardOpenOption.TRUNCATE_EXISTING)) {
 
       // Write header to data file
+      int writtenEntries = 0;
       ByteBuffer headerBuffer = ByteBuffer.allocate(16);
       headerBuffer.putLong(creationTime);
       headerBuffer.putInt(level);
-      headerBuffer.putInt(memTable.getEntries().size());
+      headerBuffer.putInt(0);
       headerBuffer.flip();
       writeDataChannel.write(headerBuffer);
 
-      // Write entries to data file and build index
+      // Write entries to data file and build sparse index
       long currentOffset = 16; // Start after header
+      long lastIndexedOffset = -1;
+      ByteArrayWrapper lastIndexedKey = null;
+      long lastEntryOffset = -1;
+      TreeMap<ByteArrayWrapper, Long> indexBuilder = new TreeMap<>();
 
       for (Map.Entry<ByteArrayWrapper, MemTable.ValueEntry> entry :
           memTable.getEntries().entrySet()) {
         byte[] key = entry.getKey().getData();
         MemTable.ValueEntry valueEntry = entry.getValue();
 
-        // Skip expired entries
         if (valueEntry.isExpired()) {
           continue;
         }
 
-        // Add key to bloom filter
-        filter.add(key);
-
-        // Create SSTableEntry
-        SSTableEntry sstEntry;
+        final byte[] value;
         if (valueEntry.isTombstone()) {
-          sstEntry = SSTableEntry.tombstone(key, valueEntry.getExpirationTime());
+          value = null;
         } else {
-          sstEntry = SSTableEntry.of(key, valueEntry.getValue(), valueEntry.getExpirationTime());
+          value = valueEntry.getValue();
+          if (value == null) {
+            logger.warn(
+                "Skipping corrupt entry during flush: non-tombstone key has no value (key length {})",
+                key.length);
+            continue;
+          }
         }
 
-        // Write entry to data file
+        filter.add(key);
+
         ByteBuffer keyBuffer = ByteBuffer.allocate(4 + key.length);
         keyBuffer.putInt(key.length);
         keyBuffer.put(key);
         keyBuffer.flip();
         writeDataChannel.write(keyBuffer);
 
-        // Write value or tombstone marker
         if (valueEntry.isTombstone()) {
-          ByteBuffer tombstoneBuffer =
-              ByteBuffer.allocate(12); // 4 bytes for int + 8 bytes for long
-          tombstoneBuffer.putInt(0); // 0 length indicates tombstone
+          ByteBuffer tombstoneBuffer = ByteBuffer.allocate(12);
+          tombstoneBuffer.putInt(0);
           tombstoneBuffer.putLong(valueEntry.getExpirationTime());
           tombstoneBuffer.flip();
           writeDataChannel.write(tombstoneBuffer);
         } else {
-          byte[] value = valueEntry.getValue();
           ByteBuffer valueBuffer = ByteBuffer.allocate(4 + value.length + 8);
           valueBuffer.putInt(value.length);
           valueBuffer.put(value);
@@ -164,17 +197,36 @@ public class SSTable {
           writeDataChannel.write(valueBuffer);
         }
 
-        // Add to sparse index
-        sparseIndex.put(entry.getKey(), currentOffset);
+        lastIndexedKey = entry.getKey();
+        lastEntryOffset = currentOffset;
+        writtenEntries++;
 
-        // Update offset for next entry
+        if (SparseIndexPolicy.shouldAddIndexEntry(currentOffset, lastIndexedOffset)) {
+          indexBuilder.put(entry.getKey(), currentOffset);
+          lastIndexedOffset = currentOffset;
+        }
+
         currentOffset = writeDataChannel.position();
       }
 
+      if (lastIndexedKey != null && lastEntryOffset != lastIndexedOffset) {
+        indexBuilder.put(lastIndexedKey, lastEntryOffset);
+      }
+
+      sparseIndex = SparseIndex.from(indexBuilder);
+      entryCount = writtenEntries;
+      writeDataChannel.position(0);
+      headerBuffer.clear();
+      headerBuffer.putLong(creationTime);
+      headerBuffer.putInt(level);
+      headerBuffer.putInt(writtenEntries);
+      headerBuffer.flip();
+      writeDataChannel.write(headerBuffer, 0);
+
       // Write index to index file
-      for (Map.Entry<ByteArrayWrapper, Long> indexEntry : sparseIndex.entrySet()) {
-        byte[] key = indexEntry.getKey().getData();
-        long offset = indexEntry.getValue();
+      for (int i = 0; i < sparseIndex.size(); i++) {
+        byte[] key = sparseIndex.keyAt(i);
+        long offset = sparseIndex.offsetAt(i);
 
         ByteBuffer indexBuffer = ByteBuffer.allocate(4 + key.length + 8);
         indexBuffer.putInt(key.length);
@@ -194,6 +246,7 @@ public class SSTable {
 
     // Open the data file for reading
     this.dataChannel = FileChannel.open(dataFilePath, StandardOpenOption.READ);
+    this.mappedDataFile = MappedDataFile.tryMap(dataChannel);
 
     // Open the index file for reading
     this.indexChannel = FileChannel.open(indexFilePath, StandardOpenOption.READ);
@@ -204,85 +257,98 @@ public class SSTable {
   private void loadFromDisk() throws IOException {
     logger.info("Loading SSTable from disk");
 
-    // Load the bloom filter
+    loadSparseIndexFromDisk();
+
+    int entryCount = 0;
+    if (Files.exists(dataFilePath)) {
+      dataChannel = FileChannel.open(dataFilePath, StandardOpenOption.READ);
+      mappedDataFile = MappedDataFile.tryMap(dataChannel);
+      entryCount = readDataFileHeader();
+    } else {
+      logger.warn("Data file not found: {}", dataFilePath);
+    }
+
     if (Files.exists(filterFilePath)) {
       this.bloomFilter = BloomFilter.load(filterFilePath.toString());
     } else {
-      logger.warn("Bloom filter file not found: " + filterFilePath);
-      this.bloomFilter = new BloomFilter(1000, 0.01); // Default filter
-    }
-
-    // Load the sparse index
-    if (Files.exists(indexFilePath)) {
-      try (FileChannel indexChannel = FileChannel.open(indexFilePath, StandardOpenOption.READ)) {
-        ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
-
-        while (indexChannel.position() < indexChannel.size()) {
-          // Read key length
-          buffer.clear();
-          buffer.limit(4);
-          indexChannel.read(buffer);
-          buffer.flip();
-          int keyLength = buffer.getInt();
-
-          // Read key
-          buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
-          buffer.limit(keyLength);
-          indexChannel.read(buffer);
-          buffer.flip();
-          byte[] key = new byte[keyLength];
-          buffer.get(key);
-
-          // Read offset
-          buffer.clear();
-          buffer.limit(8);
-          indexChannel.read(buffer);
-          buffer.flip();
-          long offset = buffer.getLong();
-
-          // Add to sparse index
-          sparseIndex.put(new ByteArrayWrapper(key), offset);
-        }
+      int expectedEntries = Math.max(entryCount, sparseIndex.size());
+      logger.warn(
+          "Bloom filter file not found: {}, rebuilding in-memory filter for {} entries",
+          filterFilePath,
+          expectedEntries);
+      this.bloomFilter = new BloomFilter(Math.max(expectedEntries, 1), BloomFilter.DEFAULT_FALSE_POSITIVE_RATE);
+      if (dataChannel != null) {
+        rebuildBloomFilterFromData();
       }
-    } else {
-      logger.warn("Index file not found: " + indexFilePath);
-    }
-
-    // Open the data file for reading
-    if (Files.exists(dataFilePath)) {
-      try {
-        // Open the data file channel
-        dataChannel = FileChannel.open(dataFilePath, StandardOpenOption.READ);
-
-        // Read header
-        ByteBuffer headerBuffer = ByteBuffer.allocate(16);
-        dataChannel.read(headerBuffer, 0);
-        headerBuffer.flip();
-
-        long storedCreationTime = headerBuffer.getLong();
-        int storedLevel = headerBuffer.getInt();
-        int entryCount = headerBuffer.getInt();
-
-        logger.info(
-            "Loaded SSTable with "
-                + entryCount
-                + " entries, level "
-                + storedLevel
-                + ", creation time "
-                + storedCreationTime);
-      } catch (IOException e) {
-        logger.error("Error opening data file", e);
-        throw e;
-      }
-    } else {
-      logger.warn("Data file not found: " + dataFilePath);
     }
 
     logger.info("SSTable loaded successfully");
   }
 
+  private void loadSparseIndexFromDisk() throws IOException {
+    if (!Files.exists(indexFilePath)) {
+      logger.warn("Index file not found: {}", indexFilePath);
+      sparseIndex = SparseIndex.empty();
+      return;
+    }
+
+    TreeMap<ByteArrayWrapper, Long> indexBuilder = new TreeMap<>();
+    try (FileChannel indexChannel = FileChannel.open(indexFilePath, StandardOpenOption.READ)) {
+      ByteBuffer buffer = ByteBuffer.allocate(1024);
+
+      while (indexChannel.position() < indexChannel.size()) {
+        buffer.clear();
+        buffer.limit(4);
+        indexChannel.read(buffer);
+        buffer.flip();
+        int keyLength = buffer.getInt();
+
+        buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
+        buffer.limit(keyLength);
+        indexChannel.read(buffer);
+        buffer.flip();
+        byte[] key = new byte[keyLength];
+        buffer.get(key);
+
+        buffer.clear();
+        buffer.limit(8);
+        indexChannel.read(buffer);
+        buffer.flip();
+        long offset = buffer.getLong();
+
+        indexBuilder.put(new ByteArrayWrapper(key), offset);
+      }
+    }
+
+    sparseIndex = SparseIndex.from(indexBuilder);
+  }
+
+  private int readDataFileHeader() throws IOException {
+    ByteBuffer headerBuffer = ByteBuffer.allocate(16);
+    dataChannel.read(headerBuffer, 0);
+    headerBuffer.flip();
+
+    long storedCreationTime = headerBuffer.getLong();
+    int storedLevel = headerBuffer.getInt();
+    int storedEntryCount = headerBuffer.getInt();
+
+    entryCount = storedEntryCount;
+    logger.info(
+        "Loaded SSTable with {} entries, level {}, creation time {}",
+        entryCount,
+        storedLevel,
+        storedCreationTime);
+    return storedEntryCount;
+  }
+
+  private void rebuildBloomFilterFromData() {
+    for (byte[] key : listKeys()) {
+      bloomFilter.add(key);
+    }
+  }
+
   public byte[] get(byte[] key) {
-    if (key == null || key.length == 0 || dataChannel == null) {
+    if (key == null || key.length == 0 || dataChannel == null || retired) {
       return null;
     }
 
@@ -292,38 +358,53 @@ public class SSTable {
     }
 
     try {
-      // Find the closest key in the sparse index
-      ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
-      Map.Entry<ByteArrayWrapper, Long> indexEntry = sparseIndex.floorEntry(keyWrapper);
-
-      if (indexEntry == null) {
-        // No entry in the sparse index that is less than or equal to the key
-        // Start from the beginning of the data file (after the header)
-        return findKeyInDataFile(key, 16);
-      } else {
-        // Start searching from the position in the sparse index
-        return findKeyInDataFile(key, indexEntry.getValue());
+      long startOffset = sparseIndex.floorOffset(key);
+      if (startOffset < 0) {
+        startOffset = 16;
       }
+
+      BufferedDataReader reader = openDataReader();
+      reader.prefetch(startOffset);
+      return findKeyInDataFile(key, startOffset, reader);
     } catch (IOException e) {
       logger.error("Error reading from SSTable", e);
       return null;
     }
   }
 
+  /** Returns true when the key maps to a live (non-tombstone) value in this SSTable. */
+  public boolean containsKey(byte[] key) {
+    if (key == null || key.length == 0 || dataChannel == null || retired) {
+      return false;
+    }
+
+    if (bloomFilter != null && !bloomFilter.mightContain(key)) {
+      return false;
+    }
+
+    try {
+      long startOffset = sparseIndex.floorOffset(key);
+      if (startOffset < 0) {
+        startOffset = 16;
+      }
+
+      BufferedDataReader reader = openDataReader();
+      reader.prefetch(startOffset);
+      return findKeyPresenceInDataFile(key, startOffset, reader);
+    } catch (IOException e) {
+      logger.error("Error checking key in SSTable", e);
+      return false;
+    }
+  }
+
   /** Smallest key in this SSTable, derived from the sparse index. */
   public byte[] getMinKey() {
-    if (sparseIndex.isEmpty()) {
-      return null;
-    }
-    return sparseIndex.firstKey().getData();
+    return sparseIndex.minKey();
   }
 
   /** Largest key in this SSTable, derived from the sparse index. */
   public byte[] getMaxKey() {
-    if (sparseIndex.isEmpty()) {
-      return null;
-    }
-    return sparseIndex.lastKey().getData();
+    return sparseIndex.maxKey();
   }
 
   /** Returns true when this table's key range intersects {@code other}'s range. */
@@ -347,72 +428,162 @@ public class SSTable {
     return minAw.compareTo(maxBw) <= 0 && minBw.compareTo(maxAw) <= 0;
   }
 
-  private byte[] findKeyInDataFile(byte[] key, long startPosition) throws IOException {
-    ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
-    long position = startPosition;
-
-    while (position < dataChannel.size()) {
-      // Read key length
-      buffer.clear();
-      buffer.limit(4);
-      dataChannel.read(buffer, position);
-      buffer.flip();
-      int keyLength = buffer.getInt();
-      position += 4;
-
-      // Read key
-      buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
-      buffer.limit(keyLength);
-      dataChannel.read(buffer, position);
-      buffer.flip();
-      byte[] entryKey = new byte[keyLength];
-      buffer.get(entryKey);
-      position += keyLength;
-
-      // Read value length
-      buffer = ReadBuffers.ensureCapacity(buffer, 4);
-      buffer.limit(4);
-      dataChannel.read(buffer, position);
-      buffer.flip();
-      int valueLength = buffer.getInt();
-      position += 4;
-
-      // Check if this is a tombstone
-      if (valueLength == 0) {
-        // Skip the timestamp (8 bytes)
-        position += 8;
-
-        // If this is the key we're looking for, it's been deleted
-        if (Arrays.equals(key, entryKey)) {
+  private byte[] findKeyInDataFile(byte[] key, long startPosition, BufferedDataReader reader)
+      throws IOException {
+    reader.seek(startPosition);
+    while (reader.position() < reader.size()) {
+      int keyLength = reader.readInt();
+      if (reader.bytesEqual(keyLength, key)) {
+        int valueLength = reader.readInt();
+        if (valueLength == 0) {
+          reader.skip(8);
           return null;
         }
-
-        continue;
-      }
-
-      // Read value
-      buffer = ReadBuffers.ensureCapacity(buffer, valueLength);
-      buffer.limit(valueLength);
-      dataChannel.read(buffer, position);
-      buffer.flip();
-      byte[] value = new byte[valueLength];
-      buffer.get(value);
-      position += valueLength;
-
-      // Skip the timestamp (8 bytes)
-      position += 8;
-
-      // If this is the key we're looking for, return the value
-      if (Arrays.equals(key, entryKey)) {
+        byte[] value = ValueBufferPool.readCopy(reader, valueLength);
+        reader.skip(8);
         return value;
       }
+
+      int valueLength = reader.readInt();
+      if (valueLength == 0) {
+        reader.skip(8);
+        continue;
+      }
+      reader.skip(valueLength + 8L);
     }
-    // Key not found
     return null;
   }
 
+  private boolean findKeyPresenceInDataFile(
+      byte[] key, long startPosition, BufferedDataReader reader) throws IOException {
+    reader.seek(startPosition);
+    while (reader.position() < reader.size()) {
+      int keyLength = reader.readInt();
+      if (reader.bytesEqual(keyLength, key)) {
+        int valueLength = reader.readInt();
+        if (valueLength == 0) {
+          reader.skip(8);
+          return false;
+        }
+        reader.skip(valueLength + 8L);
+        return true;
+      }
+
+      int valueLength = reader.readInt();
+      if (valueLength == 0) {
+        reader.skip(8);
+        continue;
+      }
+      reader.skip(valueLength + 8L);
+    }
+    return false;
+  }
+
+  private BufferedDataReader openDataReader() throws IOException {
+    if (dataChannel == null) {
+      throw new IOException("SSTable data channel is not open");
+    }
+
+    BufferedDataReader reader = threadLocalDataReader.get();
+    if (reader == null) {
+      reader =
+          new BufferedDataReader(
+              dataChannel,
+              BufferedDataReader.DEFAULT_BUFFER_SIZE,
+              blockCache,
+              sequenceNumber,
+              mappedDataFile);
+      threadLocalDataReader.set(reader);
+    }
+    return reader;
+  }
+
+  private void scanDataFile(DataFileEntryConsumer consumer) throws IOException {
+    BufferedDataReader reader = openDataReader();
+    reader.seek(16);
+    while (reader.position() < reader.size()) {
+      int keyLength = reader.readInt();
+      byte[] key = reader.readBytes(keyLength);
+      int valueLength = reader.readInt();
+
+      if (valueLength == 0) {
+        reader.skip(8);
+        continue;
+      }
+
+      byte[] value = ValueBufferPool.readCopy(reader, valueLength);
+      reader.skip(8);
+      consumer.accept(key, value);
+    }
+  }
+
+  @FunctionalInterface
+  private interface DataFileEntryConsumer {
+    void accept(byte[] key, byte[] value) throws IOException;
+  }
+
   public boolean mightContain(byte[] key) {
-    return bloomFilter != null && bloomFilter.mightContain(key);
+    return !retired && bloomFilter != null && bloomFilter.mightContain(key);
+  }
+
+  /** Retain this table for an in-flight read or compaction merge. */
+  public void pin() {
+    pinCount.incrementAndGet();
+  }
+
+  /** Release a pin acquired via {@link #pin()}. */
+  public void unpin() {
+    if (pinCount.decrementAndGet() == 0) {
+      tryFinalizeRetired();
+    }
+  }
+
+  /** Mark removed from the live set; on-disk files are deleted once unpinned. */
+  public void retire() {
+    retired = true;
+    if (blockCache != null) {
+      blockCache.invalidateSstable(sequenceNumber);
+    }
+    tryFinalizeRetired();
+  }
+
+  public boolean isRetired() {
+    return retired;
+  }
+
+  int getPinCountForTest() {
+    return pinCount.get();
+  }
+
+  private synchronized void tryFinalizeRetired() {
+    if (!retired || pinCount.get() > 0) {
+      return;
+    }
+    closeResources();
+    deleteFiles(dataFilePath.getParent().toString(), level, sequenceNumber);
+  }
+
+  private void closeResources() {
+    try {
+      if (dataChannel != null && dataChannel.isOpen()) {
+        dataChannel.close();
+      }
+      if (indexChannel != null && indexChannel.isOpen()) {
+        indexChannel.close();
+      }
+      if (bloomFilter != null) {
+        bloomFilter.close();
+      }
+      if (mappedDataFile != null) {
+        mappedDataFile.close();
+        mappedDataFile = null;
+      }
+      threadLocalDataReader.remove();
+
+      logger.info("SSTable closed: " + dataFilePath);
+    } catch (IOException e) {
+      logger.warn("Error closing SSTable resources", e);
+    }
   }
 
   public int getLevel() {
@@ -446,47 +617,38 @@ public class SSTable {
   }
 
   public void close() {
-    try {
-      if (dataChannel != null && dataChannel.isOpen()) {
-        dataChannel.close();
-      }
-      if (indexChannel != null && indexChannel.isOpen()) {
-        indexChannel.close();
-      }
-      if (bloomFilter != null) {
-        bloomFilter.close();
-      }
-
-      logger.info("SSTable closed: " + dataFilePath);
-    } catch (IOException e) {
-      logger.warn("Error closing SSTable resources", e);
-    }
+    closeResources();
   }
 
   public boolean delete() {
+    retire();
+    return true;
+  }
+
+  /** Closes and deletes on-disk files immediately (shutdown / test cleanup). */
+  public void forceCloseAndDelete() {
+    retired = true;
+    if (blockCache != null) {
+      blockCache.invalidateSstable(sequenceNumber);
+    }
+    closeResources();
+    deleteFiles(dataFilePath.getParent().toString(), level, sequenceNumber);
+  }
+
+  /** Deletes on-disk SSTable component files without opening the table. */
+  public static boolean deleteFiles(String directory, int level, long sequenceNumber) {
+    String filePrefix = String.format("sst_L%d_S%d", level, sequenceNumber);
     boolean success = true;
 
-    try {
-      // Close first to release resources
-      close();
-
-      // Delete files
-      File dataFile = dataFilePath.toFile();
-      File indexFile = indexFilePath.toFile();
-      File filterFile = filterFilePath.toFile();
-
-      if (dataFile.exists() && !dataFile.delete()) {
+    for (String suffix : new String[] {".data", ".index", ".filter"}) {
+      try {
+        if (!Files.deleteIfExists(Path.of(directory, filePrefix + suffix))) {
+          // missing file is fine
+        }
+      } catch (IOException e) {
+        logger.warn("Failed to delete SSTable file: {}{}", filePrefix, suffix, e);
         success = false;
       }
-      if (indexFile.exists() && !indexFile.delete()) {
-        success = false;
-      }
-      if (filterFile.exists() && !filterFile.delete()) {
-        success = false;
-      }
-    } catch (Exception e) {
-      logger.warn("Error deleting SSTable files", e);
-      success = false;
     }
 
     return success;
@@ -496,53 +658,9 @@ public class SSTable {
     List<byte[]> keys = new ArrayList<>();
 
     try {
-      // Scan the data file to get all keys
       if (dataChannel != null && dataChannel.isOpen()) {
-        // Start after the header
-        long position = 16;
-        ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
-
-        while (position < dataChannel.size()) {
-          // Read key length
-          buffer.clear();
-          buffer.limit(4);
-          dataChannel.read(buffer, position);
-          buffer.flip();
-          int keyLength = buffer.getInt();
-          position += 4;
-
-          // Read key
-          buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
-          buffer.limit(keyLength);
-          dataChannel.read(buffer, position);
-          buffer.flip();
-          byte[] key = new byte[keyLength];
-          buffer.get(key);
-          position += keyLength;
-
-          // Read value length
-          buffer = ReadBuffers.ensureCapacity(buffer, 4);
-          buffer.limit(4);
-          dataChannel.read(buffer, position);
-          buffer.flip();
-          int valueLength = buffer.getInt();
-          position += 4;
-
-          // Skip tombstones
-          if (valueLength == 0) {
-            // Skip the timestamp (8 bytes)
-            position += 8;
-            continue;
-          }
-
-          // Add the key to the list
-          keys.add(key);
-
-          // Skip the value and timestamp
-          position += valueLength + 8;
-        }
+        scanDataFile((key, value) -> keys.add(key));
       }
-
       return keys;
     } catch (Exception e) {
       logger.error("Error listing keys from SSTable", e);
@@ -551,14 +669,7 @@ public class SSTable {
   }
 
   public int countEntries() {
-    try {
-      // This is a simplified implementation that assumes the sparse index contains all keys
-      // A more complete implementation would scan the data file and count all entries
-      return sparseIndex.size();
-    } catch (Exception e) {
-      logger.error("Error counting entries in SSTable", e);
-      return 0;
-    }
+    return entryCount;
   }
 
   public Map<byte[], byte[]> getRange(byte[] startKey, byte[] endKey) {
@@ -574,71 +685,18 @@ public class SSTable {
       ByteArrayWrapper startWrapper = startKey != null ? new ByteArrayWrapper(startKey) : null;
       ByteArrayWrapper endWrapper = endKey != null ? new ByteArrayWrapper(endKey) : null;
 
-      // Scan the data file to get all keys in the range
       if (dataChannel != null && dataChannel.isOpen()) {
-        // Start after the header
-        long position = 16;
-        ByteBuffer buffer = ByteBuffer.allocate(1024); // Initial buffer size
-
-        while (position < dataChannel.size()) {
-          // Read key length
-          buffer.clear();
-          buffer.limit(4);
-          dataChannel.read(buffer, position);
-          buffer.flip();
-          int keyLength = buffer.getInt();
-          position += 4;
-
-          // Read key
-          buffer = ReadBuffers.ensureCapacity(buffer, keyLength);
-          buffer.limit(keyLength);
-          dataChannel.read(buffer, position);
-          buffer.flip();
-          byte[] key = new byte[keyLength];
-          buffer.get(key);
-          position += keyLength;
-
-          // Check if the key is in the range
-          ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
-          boolean inRange = true;
-          if (startWrapper != null && keyWrapper.compareTo(startWrapper) < 0) {
-            inRange = false; // Key is before the start of the range
-          }
-          if (endWrapper != null && keyWrapper.compareTo(endWrapper) >= 0) {
-            inRange = false; // Key is at or after the end of the range
-          }
-
-          // Read value length
-          buffer = ReadBuffers.ensureCapacity(buffer, 4);
-          buffer.limit(4);
-          dataChannel.read(buffer, position);
-          buffer.flip();
-          int valueLength = buffer.getInt();
-          position += 4;
-
-          // Skip tombstones
-          if (valueLength == 0) {
-            // Skip the timestamp (8 bytes)
-            position += 8;
-            continue;
-          }
-
-          // If the key is in the range, add it to the result
-          if (inRange) {
-            // Read value
-            buffer = ReadBuffers.ensureCapacity(buffer, valueLength);
-            buffer.limit(valueLength);
-            dataChannel.read(buffer, position);
-            buffer.flip();
-            byte[] value = new byte[valueLength];
-            buffer.get(value);
-
-            result.put(key, value);
-          }
-
-          // Skip the value (if we didn't read it) and timestamp
-          position += valueLength + 8;
-        }
+        scanDataFile(
+            (key, value) -> {
+              ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+              if (startWrapper != null && keyWrapper.compareTo(startWrapper) < 0) {
+                return;
+              }
+              if (endWrapper != null && keyWrapper.compareTo(endWrapper) >= 0) {
+                return;
+              }
+              result.put(key, value);
+            });
       }
 
       return result;

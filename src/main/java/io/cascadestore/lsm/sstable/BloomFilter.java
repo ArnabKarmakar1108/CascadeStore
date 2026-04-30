@@ -13,6 +13,9 @@ import org.slf4j.LoggerFactory;
 public class BloomFilter implements AutoCloseable {
   private static final Logger logger = LoggerFactory.getLogger(BloomFilter.class);
 
+  /** Target false-positive rate for newly built filters. */
+  public static final double DEFAULT_FALSE_POSITIVE_RATE = 0.005;
+
   private final ByteBuffer bitBuffer;
   private final int numHashFunctions;
   private final OffHeapAllocator allocator;
