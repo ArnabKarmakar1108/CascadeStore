@@ -48,13 +48,14 @@ class WALWriterImplTest {
     assertEquals(seqNum, result);
 
     // Verify the WALManager was called to get the current file and sequence number
-    verify(mockWalManager, times(3)).getCurrentFile();
+    verify(mockWalManager, times(2)).getCurrentFile();
     verify(mockWalManager).getNextSequenceNumber();
 
-    // Verify the WALFile was called to write the buffer and force the data to disk
+    // Verify the WALFile was called to write the buffer and batch durability was noted
     ArgumentCaptor<ByteBuffer> bufferCaptor = ArgumentCaptor.forClass(ByteBuffer.class);
     verify(mockWalFile).write(bufferCaptor.capture());
-    verify(mockWalFile).force(true);
+    verify(mockWalFile, never()).force(true);
+    verify(mockWalManager).noteBytesWritten(bufferCaptor.getValue().limit());
 
     // Verify the buffer contains the correct data
     ByteBuffer buffer = bufferCaptor.getValue();
@@ -98,13 +99,14 @@ class WALWriterImplTest {
     assertEquals(seqNum, result);
 
     // Verify the WALManager was called to get the current file and sequence number
-    verify(mockWalManager, times(3)).getCurrentFile();
+    verify(mockWalManager, times(2)).getCurrentFile();
     verify(mockWalManager).getNextSequenceNumber();
 
-    // Verify the WALFile was called to write the buffer and force the data to disk
+    // Verify the WALFile was called to write the buffer and batch durability was noted
     ArgumentCaptor<ByteBuffer> bufferCaptor = ArgumentCaptor.forClass(ByteBuffer.class);
     verify(mockWalFile).write(bufferCaptor.capture());
-    verify(mockWalFile).force(true);
+    verify(mockWalFile, never()).force(true);
+    verify(mockWalManager).noteBytesWritten(bufferCaptor.getValue().limit());
 
     // Verify the buffer contains the correct data
     ByteBuffer buffer = bufferCaptor.getValue();

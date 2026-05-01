@@ -14,6 +14,8 @@ public interface WAL extends AutoCloseable {
 
   void deleteAllLogs() throws IOException;
 
+  void sync() throws IOException;
+
   @Override
   void close() throws IOException;
 }

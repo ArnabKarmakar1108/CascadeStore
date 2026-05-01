@@ -29,13 +29,23 @@ public class WALManagerImpl implements WALManager {
   // Maximum size of a WAL file before rotation
   private final long maxLogSizeBytes;
 
+  private final long syncBatchBytes;
+
+  private long bytesSinceLastSync;
+
   public WALManagerImpl(String directory) throws IOException {
-    this(directory, 64 * 1024 * 1024); // Default 64MB max log size
+    this(directory, 64 * 1024 * 1024, WalSyncPolicy.DEFAULT_SYNC_BATCH_BYTES);
   }
 
   public WALManagerImpl(String directory, long maxLogSizeBytes) throws IOException {
+    this(directory, maxLogSizeBytes, WalSyncPolicy.DEFAULT_SYNC_BATCH_BYTES);
+  }
+
+  public WALManagerImpl(String directory, long maxLogSizeBytes, long syncBatchBytes)
+      throws IOException {
     this.directory = directory;
     this.maxLogSizeBytes = maxLogSizeBytes;
+    this.syncBatchBytes = syncBatchBytes;
     this.sequenceNumber = new AtomicLong(0);
 
     // Create directory if it doesn't exist
@@ -83,13 +93,14 @@ public class WALManagerImpl implements WALManager {
 
   @Override
   public WALFile createNewFile() throws IOException {
+    if (currentFile != null) {
+      sync();
+      currentFile.close();
+      currentFile = null;
+    }
+
     long seqNum = sequenceNumber.getAndIncrement();
     Path newLogPath = Paths.get(directory, String.format("wal_%020d.log", seqNum));
-
-    // Close the current file if it exists
-    if (currentFile != null) {
-      currentFile.close();
-    }
 
     // Create a new file
     currentFile =
@@ -137,17 +148,34 @@ public class WALManagerImpl implements WALManager {
 
   @Override
   public void rotateLog() throws IOException {
-    // Create a new log file
     createNewFile();
 
     logger.info("Rotated WAL to new file");
   }
 
   @Override
+  public void noteBytesWritten(int bytes) throws IOException {
+    bytesSinceLastSync += bytes;
+    if (bytesSinceLastSync >= syncBatchBytes) {
+      sync();
+    }
+  }
+
+  @Override
+  public void sync() throws IOException {
+    if (currentFile != null) {
+      currentFile.force(true);
+    }
+    bytesSinceLastSync = 0;
+  }
+
+  @Override
   public void deleteAllLogs() throws IOException {
-    // Close the current log file
+    sync();
+
     if (currentFile != null) {
       currentFile.close();
+      currentFile = null;
     }
 
     // Find all log files
@@ -167,6 +195,10 @@ public class WALManagerImpl implements WALManager {
     createNewFile();
 
     logger.info("Deleted all WAL files");
+  }
+
+  long getSyncBatchBytes() {
+    return syncBatchBytes;
   }
 
   @Override

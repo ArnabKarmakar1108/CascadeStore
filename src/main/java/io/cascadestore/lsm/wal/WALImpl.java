@@ -7,8 +7,11 @@ import io.cascadestore.lsm.wal.reader.WALReaderImpl;
 import io.cascadestore.lsm.wal.record.Record;
 import io.cascadestore.lsm.wal.writer.WALWriter;
 import io.cascadestore.lsm.wal.writer.WALWriterImpl;
+import io.cascadestore.lsm.wal.file.WALFile;
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,7 +20,9 @@ public class WALImpl implements WAL {
 
   private final WALManager manager;
   private final WALReader reader;
-  private final WALWriter writer;
+  private final WALWriterImpl writer;
+  private final ReadWriteLock writeLock = new ReentrantReadWriteLock();
+  private boolean closed;
 
   public WALImpl(String directory) throws IOException {
     this(directory, 64 * 1024 * 1024); // Default 64MB max log size
@@ -33,12 +38,40 @@ public class WALImpl implements WAL {
 
   @Override
   public long appendPutRecord(byte[] key, byte[] value, long ttlSeconds) throws IOException {
-    return writer.appendPutRecord(key, value, ttlSeconds);
+    writeLock.readLock().lock();
+    try {
+      if (hasCapacityForAppend()) {
+        return writer.appendPutRecordWithoutRotation(key, value, ttlSeconds);
+      }
+    } finally {
+      writeLock.readLock().unlock();
+    }
+
+    writeLock.writeLock().lock();
+    try {
+      return writer.appendPutRecord(key, value, ttlSeconds);
+    } finally {
+      writeLock.writeLock().unlock();
+    }
   }
 
   @Override
   public long appendDeleteRecord(byte[] key) throws IOException {
-    return writer.appendDeleteRecord(key);
+    writeLock.readLock().lock();
+    try {
+      if (hasCapacityForAppend()) {
+        return writer.appendDeleteRecordWithoutRotation(key);
+      }
+    } finally {
+      writeLock.readLock().unlock();
+    }
+
+    writeLock.writeLock().lock();
+    try {
+      return writer.appendDeleteRecord(key);
+    } finally {
+      writeLock.writeLock().unlock();
+    }
   }
 
   @Override
@@ -48,15 +81,43 @@ public class WALImpl implements WAL {
 
   @Override
   public void deleteAllLogs() throws IOException {
-    manager.deleteAllLogs();
+    writeLock.writeLock().lock();
+    try {
+      manager.deleteAllLogs();
+    } finally {
+      writeLock.writeLock().unlock();
+    }
+  }
+
+  @Override
+  public void sync() throws IOException {
+    writeLock.writeLock().lock();
+    try {
+      manager.sync();
+    } finally {
+      writeLock.writeLock().unlock();
+    }
   }
 
   @Override
   public void close() throws IOException {
-    if (manager.getCurrentFile() != null) {
-      manager.getCurrentFile().close();
+    writeLock.writeLock().lock();
+    try {
+      if (closed) {
+        return;
+      }
+      manager.sync();
+      if (manager.getCurrentFile() != null) {
+        manager.getCurrentFile().close();
+      }
+      closed = true;
+    } finally {
+      writeLock.writeLock().unlock();
     }
+  }
 
-    logger.info("WAL closed");
+  private boolean hasCapacityForAppend() throws IOException {
+    WALFile currentFile = manager.getCurrentFile();
+    return currentFile != null && currentFile.size() < manager.getMaxLogSizeBytes();
   }
 }

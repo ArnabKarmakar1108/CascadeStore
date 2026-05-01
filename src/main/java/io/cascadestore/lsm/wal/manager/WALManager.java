@@ -22,4 +22,8 @@ public interface WALManager {
   long getMaxLogSizeBytes();
 
   long getNextSequenceNumber();
+
+  void noteBytesWritten(int bytes) throws IOException;
+
+  void sync() throws IOException;
 }
