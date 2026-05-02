@@ -4,126 +4,168 @@ import io.cascadestore.lsm.memtable.MemTable;
 import io.cascadestore.lsm.sstable.SSTable;
 import java.util.List;
 import java.util.concurrent.locks.ReadWriteLock;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 public final class GetStore {
-  private static final Logger logger = LoggerFactory.getLogger(GetStore.class);
-
   public static final int RESULT_SUCCESS = 0;
   public static final int RESULT_INVALID_INPUT = 1;
   public static final int RESULT_KEY_NOT_FOUND = 2;
 
-  // Dependencies
-  private MemTable activeMemTable;
-  private List<MemTable> immutableMemTables;
-  private List<SSTable> ssTables;
+  private volatile MemTable activeMemTable;
+  private volatile StorageVersion storageVersion;
   private ReadWriteLock memTableLock;
+  private final boolean parallelBloomEnabled;
+  private final int parallelBloomMinTables;
 
-  // For successful get operations
-  private byte[] retrievedValue;
+  public GetStore(
+      MemTable activeMemTable, StorageVersion storageVersion, ReadWriteLock memTableLock) {
+    this(activeMemTable, storageVersion, memTableLock, true, 3);
+  }
 
   public GetStore(
       MemTable activeMemTable,
-      List<MemTable> immutableMemTables,
-      List<SSTable> ssTables,
-      ReadWriteLock memTableLock) {
-    if (activeMemTable == null) throw new IllegalArgumentException("activeMemTable cannot be null");
-    if (immutableMemTables == null)
-      throw new IllegalArgumentException("immutableMemTables cannot be null");
-    if (ssTables == null) throw new IllegalArgumentException("ssTables cannot be null");
-    if (memTableLock == null) throw new IllegalArgumentException("memTableLock cannot be null");
-
+      StorageVersion storageVersion,
+      ReadWriteLock memTableLock,
+      boolean parallelBloomEnabled,
+      int parallelBloomMinTables) {
+    if (activeMemTable == null) {
+      throw new IllegalArgumentException("activeMemTable cannot be null");
+    }
+    if (storageVersion == null) {
+      throw new IllegalArgumentException("storageVersion cannot be null");
+    }
+    if (memTableLock == null) {
+      throw new IllegalArgumentException("memTableLock cannot be null");
+    }
     this.activeMemTable = activeMemTable;
-    this.immutableMemTables = immutableMemTables;
-    this.ssTables = ssTables;
+    this.storageVersion = storageVersion;
     this.memTableLock = memTableLock;
+    this.parallelBloomEnabled = parallelBloomEnabled;
+    this.parallelBloomMinTables = parallelBloomMinTables;
   }
 
   public void updateDependencies(
-      MemTable activeMemTable,
-      List<MemTable> immutableMemTables,
-      List<SSTable> ssTables,
-      ReadWriteLock memTableLock) {
-    if (activeMemTable == null) throw new IllegalArgumentException("activeMemTable cannot be null");
-    if (immutableMemTables == null)
-      throw new IllegalArgumentException("immutableMemTables cannot be null");
-    if (ssTables == null) throw new IllegalArgumentException("ssTables cannot be null");
-    if (memTableLock == null) throw new IllegalArgumentException("memTableLock cannot be null");
-
+      MemTable activeMemTable, StorageVersion storageVersion, ReadWriteLock memTableLock) {
+    if (activeMemTable == null) {
+      throw new IllegalArgumentException("activeMemTable cannot be null");
+    }
+    if (storageVersion == null) {
+      throw new IllegalArgumentException("storageVersion cannot be null");
+    }
+    if (memTableLock == null) {
+      throw new IllegalArgumentException("memTableLock cannot be null");
+    }
     this.activeMemTable = activeMemTable;
-    this.immutableMemTables = immutableMemTables;
-    this.ssTables = ssTables;
+    this.storageVersion = storageVersion;
     this.memTableLock = memTableLock;
   }
 
-  public byte[] getRetrievedValue() {
-    return retrievedValue;
-  }
-
-  public int get(byte[] key) {
-    // Reset retrieved value
-    retrievedValue = null;
-
-    // Validate input
+  /** Returns the stored value, or {@code null} when the key is absent or invalid. */
+  public byte[] lookup(byte[] key) {
     if (key == null || key.length == 0) {
-      return RESULT_INVALID_INPUT;
+      return null;
     }
 
-    // Search in memory first (active and immutable MemTables)
-    byte[] result = getFromMemTables(key);
-
-    // If not found in memory, search in SSTables
-    if (result == null) {
-      result = getFromSSTables(key);
-    }
-
-    if (result != null) {
-      retrievedValue = result;
-      return RESULT_SUCCESS;
-    } else {
-      return RESULT_KEY_NOT_FOUND;
-    }
-  }
-
-  private byte[] getFromMemTables(byte[] key) {
-    // First, check the active MemTable
-    byte[] result = null;
-
+    MemTable active;
+    StorageVersion version;
     memTableLock.readLock().lock();
     try {
-      result = activeMemTable.get(key);
+      active = activeMemTable;
+      version = storageVersion;
     } finally {
       memTableLock.readLock().unlock();
     }
 
-    // If not found, check immutable MemTables (newest to oldest)
-    if (result == null) {
-      synchronized (immutableMemTables) {
-        for (int i = immutableMemTables.size() - 1; i >= 0; i--) {
-          MemTable memTable = immutableMemTables.get(i);
-          result = memTable.get(key);
-          if (result != null) {
-            break;
-          }
-        }
-      }
+    byte[] result = active.get(key);
+    if (result != null) {
+      return result;
     }
-    return result;
+    if (active.shadows(key)) {
+      return null;
+    }
+
+    return lookupImmutableAndSSTables(key, version);
   }
 
-  private byte[] getFromSSTables(byte[] key) {
-    synchronized (ssTables) {
-      // Search SSTables from newest to oldest
-      for (int i = ssTables.size() - 1; i >= 0; i--) {
-        SSTable ssTable = ssTables.get(i);
-        // Use bloom filter for efficient negative lookups
-        if (ssTable.mightContain(key)) {
-          byte[] result = ssTable.get(key);
-          if (result != null) {
-            return result;
-          }
-        }
+  public int get(byte[] key) {
+    if (key == null || key.length == 0) {
+      return RESULT_INVALID_INPUT;
+    }
+    return lookup(key) != null ? RESULT_SUCCESS : RESULT_KEY_NOT_FOUND;
+  }
+
+  /** Checks key presence without loading the value from SSTables. */
+  public int exists(byte[] key) {
+    if (key == null || key.length == 0) {
+      return RESULT_INVALID_INPUT;
+    }
+
+    MemTable active;
+    StorageVersion version;
+    memTableLock.readLock().lock();
+    try {
+      active = activeMemTable;
+      version = storageVersion;
+    } finally {
+      memTableLock.readLock().unlock();
+    }
+
+    if (active.containsKey(key)) {
+      return RESULT_SUCCESS;
+    }
+    if (active.shadows(key)) {
+      return RESULT_KEY_NOT_FOUND;
+    }
+
+    return existsInImmutableAndSSTables(key, version)
+        ? RESULT_SUCCESS
+        : RESULT_KEY_NOT_FOUND;
+  }
+
+  private boolean existsInImmutableAndSSTables(byte[] key, StorageVersion version) {
+    List<MemTable> immutableMemTables = version.immutableMemTables();
+    for (int i = immutableMemTables.size() - 1; i >= 0; i--) {
+      MemTable memTable = immutableMemTables.get(i);
+      if (memTable.shadows(key)) {
+        return memTable.containsKey(key);
+      }
+    }
+
+    List<SSTable> ssTables = version.ssTables();
+    boolean[] bloomCandidates =
+        BloomProbe.probeCandidates(
+            ssTables, key, parallelBloomEnabled, parallelBloomMinTables);
+    for (int i = ssTables.size() - 1; i >= 0; i--) {
+      if (!bloomCandidates[i]) {
+        continue;
+      }
+      if (ssTables.get(i).containsKey(key)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private byte[] lookupImmutableAndSSTables(byte[] key, StorageVersion version) {
+    List<MemTable> immutableMemTables = version.immutableMemTables();
+    for (int i = immutableMemTables.size() - 1; i >= 0; i--) {
+      MemTable memTable = immutableMemTables.get(i);
+      if (memTable.shadows(key)) {
+        return memTable.get(key);
+      }
+    }
+
+    List<SSTable> ssTables = version.ssTables();
+    boolean[] bloomCandidates =
+        BloomProbe.probeCandidates(
+            ssTables, key, parallelBloomEnabled, parallelBloomMinTables);
+    for (int i = ssTables.size() - 1; i >= 0; i--) {
+      if (!bloomCandidates[i]) {
+        continue;
+      }
+      SSTable ssTable = ssTables.get(i);
+      byte[] result = ssTable.get(key);
+      if (result != null) {
+        return result;
       }
     }
     return null;
