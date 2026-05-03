@@ -18,7 +18,7 @@ public final class DeleteStore {
   public static final int RESULT_KEY_NOT_FOUND = 4;
 
   // Dependencies
-  private MemTable activeMemTable;
+  private volatile MemTable activeMemTable;
   private ReadWriteLock memTableLock;
   private WAL wal;
   private AtomicBoolean recovering;
@@ -78,9 +78,9 @@ public final class DeleteStore {
       return RESULT_INVALID_INPUT;
     }
 
-    // First check if the key exists
-    int getResult = getStore.get(key);
-    if (getResult != GetStore.RESULT_SUCCESS) {
+    // Check existence without loading values from SSTables.
+    int result = getStore.exists(key);
+    if (result != GetStore.RESULT_SUCCESS) {
       return RESULT_KEY_NOT_FOUND;
     }
 

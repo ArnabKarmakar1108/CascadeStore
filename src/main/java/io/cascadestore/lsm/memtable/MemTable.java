@@ -62,6 +62,10 @@ public class MemTable {
         return null;
       }
 
+      if (HEADER_SIZE + valueLength > buffer.capacity()) {
+        return null;
+      }
+
       byte[] result = new byte[valueLength];
       buffer.get(HEADER_SIZE, result, 0, valueLength);
       return result;
@@ -171,6 +175,19 @@ public class MemTable {
     ValueEntry entry = entries.get(keyWrapper);
 
     return entry != null && !entry.isExpired() && !entry.isTombstone();
+  }
+
+  /**
+   * Returns true when this memtable holds a non-expired entry for the key, including tombstones that
+   * shadow older tiers.
+   */
+  public boolean shadows(byte[] key) {
+    if (key == null || key.length == 0) {
+      return false;
+    }
+
+    ValueEntry entry = entries.get(new ByteArrayWrapper(key));
+    return entry != null && !entry.isExpired();
   }
 
   public Map<ByteArrayWrapper, ValueEntry> getEntries() {

@@ -9,6 +9,14 @@ public interface Storage {
 
   boolean put(byte[] key, byte[] value, long ttlSeconds);
 
+  /**
+   * Reads the current value for {@code key}, applies {@code merger}, then persists the result.
+   *
+   * @return {@code true} when the key existed and the merged value was written; {@code false} when
+   *     the key is absent (including tombstones) or the merger returns {@code null}
+   */
+  boolean merge(byte[] key, ValueMerger merger);
+
   byte[] get(byte[] key);
 
   boolean delete(byte[] key);

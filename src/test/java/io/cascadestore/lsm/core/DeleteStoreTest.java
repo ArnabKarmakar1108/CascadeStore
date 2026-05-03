@@ -55,12 +55,12 @@ class DeleteStoreTest {
     byte[] key = "key".getBytes();
 
     // Mock GetStore to return KeyNotFound
-    when(mockGetStore.get(key)).thenReturn(GetStore.RESULT_KEY_NOT_FOUND);
+    when(mockGetStore.exists(key)).thenReturn(GetStore.RESULT_KEY_NOT_FOUND);
 
     int result = deleteStore.delete(key);
 
     assertEquals(DeleteStore.RESULT_KEY_NOT_FOUND, result);
-    verify(mockGetStore).get(key);
+    verify(mockGetStore).exists(key);
     verifyNoInteractions(mockWal, mockMemTable);
   }
 
@@ -69,13 +69,13 @@ class DeleteStoreTest {
     byte[] key = "key".getBytes();
 
     // Mock GetStore to return Success
-    when(mockGetStore.get(key)).thenReturn(GetStore.RESULT_SUCCESS);
+    when(mockGetStore.exists(key)).thenReturn(GetStore.RESULT_SUCCESS);
     when(mockMemTable.delete(key)).thenReturn(true);
 
     int result = deleteStore.delete(key);
 
     assertEquals(DeleteStore.RESULT_SUCCESS, result);
-    verify(mockGetStore).get(key);
+    verify(mockGetStore).exists(key);
     verify(mockWal).appendDeleteRecord(key);
     verify(mockMemTable).delete(key);
   }
@@ -85,13 +85,13 @@ class DeleteStoreTest {
     byte[] key = "key".getBytes();
 
     // Mock GetStore to return Success
-    when(mockGetStore.get(key)).thenReturn(GetStore.RESULT_SUCCESS);
+    when(mockGetStore.exists(key)).thenReturn(GetStore.RESULT_SUCCESS);
     doThrow(new IOException("WAL error")).when(mockWal).appendDeleteRecord(key);
 
     int result = deleteStore.delete(key);
 
     assertEquals(DeleteStore.RESULT_WAL_ERROR, result);
-    verify(mockGetStore).get(key);
+    verify(mockGetStore).exists(key);
     verify(mockWal).appendDeleteRecord(key);
     verifyNoInteractions(mockMemTable);
     assertNotNull(deleteStore.getLastException());
@@ -102,14 +102,14 @@ class DeleteStoreTest {
     byte[] key = "key".getBytes();
 
     // Mock GetStore to return Success
-    when(mockGetStore.get(key)).thenReturn(GetStore.RESULT_SUCCESS);
+    when(mockGetStore.exists(key)).thenReturn(GetStore.RESULT_SUCCESS);
     when(mockMemTable.delete(key)).thenReturn(false);
     when(mockMemTable.isFull()).thenReturn(true);
 
     int result = deleteStore.delete(key);
 
     assertEquals(DeleteStore.RESULT_MEMTABLE_FULL, result);
-    verify(mockGetStore).get(key);
+    verify(mockGetStore).exists(key);
     verify(mockWal).appendDeleteRecord(key);
     verify(mockMemTable).delete(key);
     verify(mockMemTable).isFull();
@@ -123,13 +123,13 @@ class DeleteStoreTest {
     recovering.set(true);
 
     // Mock GetStore to return Success
-    when(mockGetStore.get(key)).thenReturn(GetStore.RESULT_SUCCESS);
+    when(mockGetStore.exists(key)).thenReturn(GetStore.RESULT_SUCCESS);
     when(mockMemTable.delete(key)).thenReturn(true);
 
     int result = deleteStore.delete(key);
 
     assertEquals(DeleteStore.RESULT_SUCCESS, result);
-    verify(mockGetStore).get(key);
+    verify(mockGetStore).exists(key);
     verifyNoInteractions(mockWal); // WAL should not be called during recovery
     verify(mockMemTable).delete(key);
   }
@@ -150,13 +150,13 @@ class DeleteStoreTest {
     // Test that the new dependencies are used
     byte[] key = "key".getBytes();
 
-    when(newMockGetStore.get(key)).thenReturn(GetStore.RESULT_SUCCESS);
+    when(newMockGetStore.exists(key)).thenReturn(GetStore.RESULT_SUCCESS);
     when(newMockMemTable.delete(key)).thenReturn(true);
 
     int result = deleteStore.delete(key);
 
     assertEquals(DeleteStore.RESULT_SUCCESS, result);
-    verify(newMockGetStore).get(key);
+    verify(newMockGetStore).exists(key);
     verifyNoInteractions(
         newMockWal); // WAL should not be called during recovery (newRecovering is true)
     verify(newMockMemTable).delete(key);
