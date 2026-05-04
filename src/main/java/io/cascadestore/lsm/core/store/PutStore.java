@@ -17,7 +17,7 @@ public final class PutStore {
   public static final int RESULT_MEMTABLE_FULL = 3;
 
   // Dependencies
-  private MemTable activeMemTable;
+  private volatile MemTable activeMemTable;
   private ReadWriteLock memTableLock;
   private WAL wal;
   private AtomicBoolean recovering;

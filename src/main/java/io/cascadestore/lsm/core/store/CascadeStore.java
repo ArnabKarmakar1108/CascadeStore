@@ -3,11 +3,13 @@ package io.cascadestore.lsm.core.store;
 import io.cascadestore.lsm.api.ByteArrayWrapper;
 import io.cascadestore.lsm.api.KeyValueIterator;
 import io.cascadestore.lsm.api.Storage;
+import io.cascadestore.lsm.api.ValueMerger;
 import io.cascadestore.lsm.config.CascadeConfig;
 import io.cascadestore.lsm.core.backgroundservice.CleanupService;
 import io.cascadestore.lsm.core.backgroundservice.CompactionService;
 import io.cascadestore.lsm.core.backgroundservice.FlushService;
 import io.cascadestore.lsm.core.compaction.CompactionStrategyType;
+import io.cascadestore.lsm.io.BlockCache;
 import io.cascadestore.lsm.memtable.MemTable;
 import io.cascadestore.lsm.sstable.SSTable;
 import io.cascadestore.lsm.wal.WAL;
@@ -52,9 +54,12 @@ public class CascadeStore implements Storage {
   // Concurrency control
   private final ReadWriteLock memTableLock;
   private final AtomicLong sequenceNumber;
+  private final AtomicLong layoutVersionId;
+  private volatile StorageVersion storageVersion;
   private final AtomicBoolean recovering;
 
   // Background services
+  private final BlockCache blockCache;
   private final CompactionService compactionService;
   private final CleanupService cleanupService;
   private final FlushService flushService;
@@ -63,6 +68,7 @@ public class CascadeStore implements Storage {
   private PutStore putStore;
   private GetStore getStore;
   private DeleteStore deleteStore;
+  private MergeStore mergeStore;
 
   public CascadeStore() {
     this(CascadeConfig.getDefault());
@@ -108,6 +114,8 @@ public class CascadeStore implements Storage {
     // Initialize concurrency control
     this.memTableLock = new ReentrantReadWriteLock();
     this.sequenceNumber = new AtomicLong(0);
+    this.layoutVersionId = new AtomicLong(0);
+    this.storageVersion = StorageVersion.empty(0);
     this.recovering = new AtomicBoolean(false);
 
     // Create data directory if it doesn't exist
@@ -115,6 +123,8 @@ public class CascadeStore implements Storage {
     if (!dir.exists()) {
       dir.mkdirs();
     }
+
+    this.blockCache = BlockCache.create(config.blockCacheSizeBytes());
 
     // Load existing SSTables from disk
     loadSSTables();
@@ -134,11 +144,26 @@ public class CascadeStore implements Storage {
     }
 
     // Initialize background services
-    this.compactionService = new CompactionService(ssTables, config, sequenceNumber);
+    this.compactionService =
+        new CompactionService(
+            ssTables,
+            config,
+            sequenceNumber,
+            this::publishStorageLayout,
+            blockCache,
+            layoutVersionId::get);
     this.cleanupService =
         new CleanupService(activeMemTable, immutableMemTables, memTableLock, config);
     this.flushService =
-        new FlushService(immutableMemTables, ssTables, config, sequenceNumber, compactionService);
+        new FlushService(
+            immutableMemTables,
+            ssTables,
+            config,
+            sequenceNumber,
+            compactionService,
+            this::truncateWalIfAllDataFlushed,
+            this::publishStorageLayout,
+            blockCache);
 
     // Start background services
     compactionService.start();
@@ -148,14 +173,43 @@ public class CascadeStore implements Storage {
     // Initialize operation stores
     putStore = new PutStore(activeMemTable, memTableLock, wal, recovering);
 
-    getStore = new GetStore(activeMemTable, immutableMemTables, ssTables, memTableLock);
+    getStore =
+        new GetStore(
+            activeMemTable,
+            storageVersion,
+            memTableLock,
+            config.parallelBloomEnabled(),
+            config.parallelBloomMinTables());
 
     deleteStore = new DeleteStore(activeMemTable, memTableLock, wal, recovering, getStore);
+
+    mergeStore = new MergeStore(activeMemTable, memTableLock, wal, recovering, getStore);
+
+    publishStorageLayout();
 
     logger.info("CascadeStore initialized with data directory: " + config.dataDirectory());
   }
 
-  
+  /** Publishes an immutable snapshot of immutable-memtable and SSTable tiers for readers. */
+  void publishStorageLayout() {
+    List<MemTable> immutableCopy;
+    synchronized (immutableMemTables) {
+      immutableCopy = new ArrayList<>(immutableMemTables);
+    }
+    List<SSTable> ssTableCopy;
+    synchronized (ssTables) {
+      ssTableCopy = new ArrayList<>(ssTables);
+    }
+    StorageVersion previous = storageVersion;
+    storageVersion =
+        new StorageVersion(layoutVersionId.incrementAndGet(), immutableCopy, ssTableCopy);
+    if (previous != null) {
+      previous.release();
+    }
+    getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
+  }
+
+
   // Initialization and Recovery
   private void loadSSTables() {
     File dataDir = new File(config.dataDirectory());
@@ -186,7 +240,7 @@ public class CascadeStore implements Storage {
           sequenceNumber.updateAndGet(current -> Math.max(current, seq + 1));
 
           // Load the SSTable
-          SSTable ssTable = new SSTable(config.dataDirectory(), level, seq);
+          SSTable ssTable = new SSTable(config.dataDirectory(), level, seq, blockCache);
           ssTables.add(ssTable);
 
           logger.info("Loaded SSTable: " + fileName);
@@ -214,7 +268,7 @@ public class CascadeStore implements Storage {
         return;
       }
 
-      logger.info("Recovering %d records from WAL", records.size());
+      logger.info("Recovering {} records from WAL", records.size());
 
       // Sort records by sequence number to ensure correct order
       records.sort((r1, r2) -> Long.compare(r1.getSequenceNumber(), r2.getSequenceNumber()));
@@ -243,11 +297,57 @@ public class CascadeStore implements Storage {
     }
   }
 
-  
+  /**
+   * Deletes WAL segments once every memtable entry has been flushed to SSTables. Safe to call after
+   * a flush batch when no immutable memtables remain and the active memtable is empty.
+   */
+  private void truncateWalIfAllDataFlushed() {
+    if (wal == null) {
+      return;
+    }
+
+    synchronized (immutableMemTables) {
+      if (!immutableMemTables.isEmpty()) {
+        return;
+      }
+    }
+
+    memTableLock.readLock().lock();
+    try {
+      if (!activeMemTable.getEntries().isEmpty()) {
+        return;
+      }
+    } finally {
+      memTableLock.readLock().unlock();
+    }
+
+    truncateWal();
+  }
+
+  private void truncateWal() {
+    if (wal == null) {
+      return;
+    }
+    try {
+      wal.sync();
+      wal.deleteAllLogs();
+      logger.info("WAL truncated; memtable state is durable in SSTables");
+    } catch (IOException e) {
+      logger.warn("Failed to truncate WAL", e);
+    }
+  }
+
+
   // MemTable Management and Maintenance
   private void switchMemTable() {
+    boolean shouldFlush = false;
     memTableLock.writeLock().lock();
     try {
+      // Another writer may have already rotated the active MemTable.
+      if (!activeMemTable.isFull()) {
+        return;
+      }
+
       // Make the current MemTable immutable
       activeMemTable.makeImmutable();
 
@@ -260,41 +360,45 @@ public class CascadeStore implements Storage {
       activeMemTable = new MemTable(config.memTableMaxSizeBytes());
 
       // Update the GetStore and PutStore with the new state
-      getStore.updateDependencies(activeMemTable, immutableMemTables, ssTables, memTableLock);
+      getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
       putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
       deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+      mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+
+      try {
+        wal.sync();
+      } catch (IOException e) {
+        logger.warn("Failed to sync WAL during MemTable switch", e);
+      }
 
       logger.info("Switched to new MemTable, old one scheduled for flushing");
 
-      // Trigger an immediate flush to ensure data is persisted to disk
-      flushMemTables();
+      publishStorageLayout();
+      shouldFlush = true;
     } finally {
       memTableLock.writeLock().unlock();
+    }
+
+    if (shouldFlush) {
+      flushService.executeNow();
     }
   }
 
   // Core Operations (put, get, delete)
   @Override
   public boolean put(byte[] key, byte[] value, long ttlSeconds) {
-    // Delegate to PutStore
-    int result = putStore.put(key, value, ttlSeconds);
-
-    // Handle the result
-    if (result == PutStore.RESULT_SUCCESS) {
-      return true;
-    } else if (result == PutStore.RESULT_MEMTABLE_FULL) {
-      // Switch to a new MemTable and try again
+    for (int attempt = 0; attempt < 32; attempt++) {
+      int result = putStore.put(key, value, ttlSeconds);
+      if (result == PutStore.RESULT_SUCCESS) {
+        return true;
+      }
+      if (result != PutStore.RESULT_MEMTABLE_FULL) {
+        return false;
+      }
       switchMemTable();
-
-      // Create a new PutStore with the updated activeMemTable
-      putStore = new PutStore(activeMemTable, memTableLock, wal, recovering);
-
-      // Try again with the new MemTable
-      int newResult = putStore.put(key, value, ttlSeconds);
-      return newResult == PutStore.RESULT_SUCCESS;
-    } else {
-      return false;
+      putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
     }
+    return false;
   }
 
   @Override
@@ -303,43 +407,46 @@ public class CascadeStore implements Storage {
   }
 
   @Override
-  public byte[] get(byte[] key) {
-    // Delegate to GetStore
-    int result = getStore.get(key);
-
-    // Handle the result
-    if (result == GetStore.RESULT_SUCCESS) {
-      return getStore.getRetrievedValue();
-    } else {
-      return null;
+  public boolean merge(byte[] key, ValueMerger merger) {
+    for (int attempt = 0; attempt < 32; attempt++) {
+      int result = mergeStore.merge(key, merger);
+      if (result == MergeStore.RESULT_SUCCESS) {
+        return true;
+      }
+      if (result == MergeStore.RESULT_KEY_NOT_FOUND) {
+        return false;
+      }
+      if (result != MergeStore.RESULT_MEMTABLE_FULL) {
+        return false;
+      }
+      switchMemTable();
+      mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
     }
+    return false;
+  }
+
+  @Override
+  public byte[] get(byte[] key) {
+    return getStore.lookup(key);
   }
 
   @Override
   public boolean delete(byte[] key) {
-    // Delegate to DeleteStore
-    int result = deleteStore.delete(key);
-
-    // Handle the result
-    if (result == DeleteStore.RESULT_SUCCESS) {
-      return true;
-    } else if (result == DeleteStore.RESULT_MEMTABLE_FULL) {
-      // Switch to a new MemTable and try again
+    for (int attempt = 0; attempt < 32; attempt++) {
+      int result = deleteStore.delete(key);
+      if (result == DeleteStore.RESULT_SUCCESS) {
+        return true;
+      }
+      if (result != DeleteStore.RESULT_MEMTABLE_FULL) {
+        return false;
+      }
       switchMemTable();
-
-      // Create a new DeleteStore with the updated activeMemTable
-      DeleteStore newDeleteStore =
-          new DeleteStore(activeMemTable, memTableLock, wal, recovering, getStore);
-
-      // Try again with the new MemTable
-      int newResult = newDeleteStore.delete(key);
-      return newResult == DeleteStore.RESULT_SUCCESS;
-    } else {
-      return false;
+      deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
     }
+    return false;
   }
 
-  
+
   // Query Operations (listKeys, containsKey, size, getRange, getIterator)
   @Override
   public List<byte[]> listKeys() {
@@ -400,11 +507,7 @@ public class CascadeStore implements Storage {
       return false;
     }
 
-    // Delegate to GetStore
-    int result = getStore.get(key);
-
-    // If the result is Success, the key exists
-    return result == GetStore.RESULT_SUCCESS;
+    return getStore.lookup(key) != null;
   }
 
   @Override
@@ -448,7 +551,7 @@ public class CascadeStore implements Storage {
     return totalSize;
   }
 
-  
+
   // Lifecycle Operations (clear, shutdown)
   @Override
   public void clear() {
@@ -472,13 +575,14 @@ public class CascadeStore implements Storage {
     // Clear SSTables
     synchronized (ssTables) {
       for (SSTable ssTable : ssTables) {
-        ssTable.delete();
+        ssTable.forceCloseAndDelete();
       }
       ssTables.clear();
     }
 
     // Reset sequence number
     sequenceNumber.set(0);
+    layoutVersionId.set(0);
 
     // Delete all WAL files
     try {
@@ -488,9 +592,11 @@ public class CascadeStore implements Storage {
     }
 
     // Update the GetStore and PutStore with the new state
-    getStore.updateDependencies(activeMemTable, immutableMemTables, ssTables, memTableLock);
+    getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
     putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
     deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+    mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+    publishStorageLayout();
 
     logger.info("CascadeStore cleared");
   }
@@ -549,68 +655,62 @@ public class CascadeStore implements Storage {
   }
 
   public void flushMemTables() {
-    System.out.println("[DEBUG] CascadeStore.flushMemTables called");
-
-    // Log the number of immutable MemTables
-    synchronized (immutableMemTables) {
-      System.out.println("[DEBUG] Number of immutable MemTables: " + immutableMemTables.size());
+    if (logger.isDebugEnabled()) {
+      synchronized (immutableMemTables) {
+        logger.debug(
+            "flushMemTables: {} immutable MemTables pending", immutableMemTables.size());
+      }
     }
 
-    // Flush any pending data
     flushService.executeNow();
 
-    // Log the number of SSTables
-    synchronized (ssTables) {
-      System.out.println("[DEBUG] Number of SSTables after flush: " + ssTables.size());
-
-      // Log the SSTable files
-      for (SSTable ssTable : ssTables) {
-        System.out.println("[DEBUG] SSTable: " + ssTable.getSequenceNumber());
+    if (logger.isDebugEnabled()) {
+      synchronized (ssTables) {
+        logger.debug("flushMemTables: {} SSTables after flush", ssTables.size());
+        for (SSTable ssTable : ssTables) {
+          logger.debug("flushMemTables: SSTable seq={}", ssTable.getSequenceNumber());
+        }
       }
     }
   }
 
   public void switchMemTableForTest() {
-    System.out.println("[DEBUG] CascadeStore.switchMemTableForTest called");
-
-    // Log the active MemTable size and entries
-    System.out.println(
-        "[DEBUG] Active MemTable size: "
-            + activeMemTable.getSizeBytes()
-            + " bytes, entries: "
-            + activeMemTable.getEntries().size());
+    if (logger.isDebugEnabled()) {
+      logger.debug(
+          "switchMemTableForTest: active MemTable size={} bytes, entries={}",
+          activeMemTable.getSizeBytes(),
+          activeMemTable.getEntries().size());
+    }
 
     memTableLock.writeLock().lock();
     try {
-      // Make the current MemTable immutable
       activeMemTable.makeImmutable();
-      System.out.println("[DEBUG] Made active MemTable immutable");
 
-      // Add it to the list of immutable MemTables
       synchronized (immutableMemTables) {
         immutableMemTables.add(activeMemTable);
-        System.out.println(
-            "[DEBUG] Added active MemTable to immutable list, total: "
-                + immutableMemTables.size());
+        if (logger.isDebugEnabled()) {
+          logger.debug(
+              "switchMemTableForTest: {} immutable MemTables queued",
+              immutableMemTables.size());
+        }
       }
 
-      // Create a new active MemTable
       activeMemTable = new MemTable(config.memTableMaxSizeBytes());
-      System.out.println("[DEBUG] Created new active MemTable");
 
-      // Update the GetStore and PutStore with the new state
-      getStore.updateDependencies(activeMemTable, immutableMemTables, ssTables, memTableLock);
+      getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
       putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
       deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+      mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+
+      publishStorageLayout();
 
       logger.info("Switched to new MemTable for testing");
-      System.out.println("[DEBUG] Updated dependencies");
     } finally {
       memTableLock.writeLock().unlock();
     }
   }
 
-  
+
   // Iterator Implementation
   private class CascadeIterator implements KeyValueIterator {
     private final ByteArrayWrapper startKeyWrapper;
@@ -761,6 +861,8 @@ public class CascadeStore implements Storage {
 
       flushService.executeNow();
 
+      truncateWal();
+
       // Shutdown background services
       flushService.shutdown();
       compactionService.shutdown();
@@ -777,6 +879,10 @@ public class CascadeStore implements Storage {
       }
 
       // Close all SSTables
+      StorageVersion version = storageVersion;
+      if (version != null) {
+        version.release();
+      }
       synchronized (ssTables) {
         for (SSTable ssTable : ssTables) {
           ssTable.close();

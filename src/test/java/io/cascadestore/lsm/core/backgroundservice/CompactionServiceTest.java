@@ -48,8 +48,7 @@ class CompactionServiceTest {
     compactionService.shutdown();
     for (SSTable ssTable : ssTables) {
       try {
-        ssTable.close();
-        ssTable.delete();
+        ssTable.forceCloseAndDelete();
       } catch (Exception e) {
         // Ignore
       }

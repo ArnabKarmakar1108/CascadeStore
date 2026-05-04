@@ -4,7 +4,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.cascadestore.lsm.api.KeyValueIterator;
 import io.cascadestore.lsm.core.store.CascadeStore;
+import io.cascadestore.lsm.wal.WALImpl;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -407,6 +409,32 @@ class CascadeStoreTest {
       assertNull(iterator.peekNextKey());
     } catch (Exception e) {
       fail("Iterator should not throw exception: " + e.getMessage());
+    }
+  }
+
+  @Test
+  void testShutdownTruncatesWalBeforeRestart() throws IOException {
+    byte[] key = "persisted".getBytes();
+    byte[] value = "value".getBytes();
+    assertTrue(store.put(key, value));
+
+    store.shutdown();
+    store = null;
+
+    Path walDir = tempDir.resolve("wal");
+    long walBytes = 0;
+    try (var stream = Files.newDirectoryStream(walDir, "wal_*.log")) {
+      for (Path logFile : stream) {
+        walBytes += Files.size(logFile);
+      }
+    }
+    assertEquals(0, walBytes, "WAL should be empty after graceful shutdown");
+
+    store = new CascadeStore(1024 * 1024, tempDir.toString(), 4);
+    assertArrayEquals(value, store.get(key));
+
+    try (WALImpl wal = new WALImpl(walDir.toString())) {
+      assertTrue(wal.readRecords().isEmpty(), "Restart should not replay persisted WAL records");
     }
   }
 }

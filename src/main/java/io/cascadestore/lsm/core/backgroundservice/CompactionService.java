@@ -7,6 +7,8 @@ import io.cascadestore.lsm.core.compaction.CompactionStrategyType;
 import io.cascadestore.lsm.core.compaction.LevelTieredCompactionStrategy;
 import io.cascadestore.lsm.core.compaction.SizeTieredCompactionStrategy;
 import io.cascadestore.lsm.core.compaction.ThresholdCompactionStrategy;
+import io.cascadestore.lsm.core.store.StorageLayoutPublisher;
+import io.cascadestore.lsm.io.BlockCache;
 import io.cascadestore.lsm.memtable.MemTable;
 import io.cascadestore.lsm.sstable.SSTable;
 import java.io.IOException;
@@ -19,8 +21,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 public class CompactionService extends AbstractBackgroundService {
 
@@ -31,14 +33,47 @@ public class CompactionService extends AbstractBackgroundService {
   private final CascadeConfig config;
   private final AtomicLong sequenceNumber;
   private final CompactionStrategy compactionStrategy;
+  private final StorageLayoutPublisher layoutPublisher;
+  private final BlockCache blockCache;
+  private final LongSupplier layoutVersionSupplier;
 
   public CompactionService(
       List<SSTable> ssTables, CascadeConfig config, AtomicLong sequenceNumber) {
+    this(ssTables, config, sequenceNumber, null, null, null);
+  }
+
+  public CompactionService(
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      StorageLayoutPublisher layoutPublisher) {
+    this(ssTables, config, sequenceNumber, layoutPublisher, null, null);
+  }
+
+  public CompactionService(
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      StorageLayoutPublisher layoutPublisher,
+      BlockCache blockCache) {
+    this(ssTables, config, sequenceNumber, layoutPublisher, blockCache, null);
+  }
+
+  public CompactionService(
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      StorageLayoutPublisher layoutPublisher,
+      BlockCache blockCache,
+      LongSupplier layoutVersionSupplier) {
     super("Compaction");
     this.ssTables = ssTables;
     this.config = config;
     this.sequenceNumber = sequenceNumber;
     this.compactionStrategy = createCompactionStrategy(config);
+    this.layoutPublisher = layoutPublisher;
+    this.blockCache = blockCache;
+    this.layoutVersionSupplier = layoutVersionSupplier;
   }
 
   private CompactionStrategy createCompactionStrategy(CascadeConfig config) {
@@ -59,87 +94,108 @@ public class CompactionService extends AbstractBackgroundService {
 
   @Override
   protected void doExecute() {
+    List<SSTable> tablesToCompact = null;
+    long layoutVersionAtStart = -1;
     try {
       synchronized (ssTables) {
-        // Use the compaction strategy to determine if compaction should be performed
         if (!compactionStrategy.shouldCompact(ssTables)) {
           logger.info(
-              "Skipping compaction, compaction strategy (%s) determined it's not needed",
+              "Skipping compaction, compaction strategy ({}) determined it's not needed",
               compactionStrategy.getName());
           return;
         }
 
-        // Use the compaction strategy to select the tables to compact
-        List<SSTable> tablesToCompact = compactionStrategy.selectTableToCompact(ssTables);
-
-        // Skip if no tables were selected for compaction
+        tablesToCompact = compactionStrategy.selectTableToCompact(ssTables);
         if (tablesToCompact.isEmpty()) {
           logger.info("Skipping compaction, no SSTables selected for compaction");
           return;
         }
 
-        logger.info(
-            "Starting compaction process with %d SSTables using %s",
-            ssTables.size(),
-            compactionStrategy.getName());
+        tablesToCompact = new ArrayList<>(tablesToCompact);
+        if (layoutVersionSupplier != null) {
+          layoutVersionAtStart = layoutVersionSupplier.getAsLong();
+        }
+        for (SSTable ssTable : tablesToCompact) {
+          ssTable.pin();
+        }
+      }
 
-        logger.info(
-            "Compacting %d SSTables spanning levels %s",
-            tablesToCompact.size(),
-            levelSummary(tablesToCompact));
+      logger.info(
+          "Starting compaction process with {} SSTables using {}",
+          tablesToCompact.size(),
+          compactionStrategy.getName());
 
-        // Process SSTables in parallel to improve I/O throughput during merge
-        ExecutorService executor =
-            Executors.newCachedThreadPool(
-                r -> {
-                  Thread thread = new Thread(r, "compaction-io");
-                  thread.setDaemon(true);
-                  return thread;
-                });
+      logger.info(
+          "Compacting {} SSTables spanning levels {}",
+          tablesToCompact.size(),
+          levelSummary(tablesToCompact));
 
-        MemTable mergedMemTable = null;
-        try {
-          // Create a temporary MemTable to merge the SSTables (sized from input bytes)
-          long mergeCapacity = computeMergeMemTableCapacity(tablesToCompact);
-          mergedMemTable = new MemTable(mergeCapacity);
+      ExecutorService executor =
+          Executors.newCachedThreadPool(
+              r -> {
+                Thread thread = new Thread(r, "compaction-io");
+                thread.setDaemon(true);
+                return thread;
+              });
 
-          // Merge SSTables; newer SSTables take precedence over older ones
-          Map<ByteArrayWrapper, byte[]> mergedData =
-              mergeSSTableEntries(tablesToCompact, executor);
-          if (mergedData == null) {
-            logger.error("Compaction aborted during SSTable read; input SSTables preserved");
-            return;
-          }
+      MemTable mergedMemTable = null;
+      boolean committed = false;
+      try {
+        long mergeCapacity = computeMergeMemTableCapacity(tablesToCompact);
+        mergedMemTable = new MemTable(mergeCapacity);
 
-          // Check if we have any data to merge
-          if (mergedData.isEmpty()) {
-            logger.warn(
-                "No data to merge during compaction; input SSTables preserved");
-            return;
-          }
+        Map<ByteArrayWrapper, byte[]> mergedData =
+            mergeSSTableEntries(tablesToCompact, executor);
+        if (mergedData == null) {
+          logger.error("Compaction aborted during SSTable read; input SSTables preserved");
+          return;
+        }
 
-          // Add all merged data to the MemTable
-          if (!loadIntoMemTable(mergedMemTable, mergedData)) {
-            logger.error(
-                "Compaction aborted: merge MemTable capacity {} bytes exceeded; input SSTables preserved",
-                mergeCapacity);
-            return;
-          }
+        if (mergedData.isEmpty()) {
+          logger.warn("No data to merge during compaction; input SSTables preserved");
+          return;
+        }
 
-          // Create a new SSTable at the output level and remove the old SSTables
-          commitCompaction(tablesToCompact, mergedMemTable);
-          mergedMemTable.close();
-          mergedMemTable = null;
-        } catch (OutOfMemoryError oom) {
-          // Abort without deleting inputs when the JVM runs out of heap during merge
+        if (!loadIntoMemTable(mergedMemTable, mergedData)) {
           logger.error(
-              "Compaction aborted due to out-of-memory; input SSTables preserved", oom);
-        } finally {
-          if (mergedMemTable != null) {
-            mergedMemTable.close();
+              "Compaction aborted: merge MemTable capacity {} bytes exceeded; input SSTables preserved",
+              mergeCapacity);
+          return;
+        }
+
+        int outputLevel = compactionStrategy.getCompactionOutputLevel(tablesToCompact);
+        long newSequenceNumber = sequenceNumber.getAndIncrement();
+        SSTable compactedTable =
+            new SSTable(
+                mergedMemTable, config.dataDirectory(), outputLevel, newSequenceNumber, blockCache);
+        mergedMemTable.close();
+        mergedMemTable = null;
+
+        if (!commitCompaction(tablesToCompact, compactedTable, layoutVersionAtStart)) {
+          compactedTable.forceCloseAndDelete();
+          return;
+        }
+        committed = true;
+
+        logger.info(
+            "Compaction completed. Created new SSTable at level {} with sequence number {}",
+            outputLevel,
+            newSequenceNumber);
+      } catch (OutOfMemoryError oom) {
+        logger.error(
+            "Compaction aborted due to out-of-memory; input SSTables preserved", oom);
+      } finally {
+        if (mergedMemTable != null) {
+          mergedMemTable.close();
+        }
+        executor.shutdown();
+        if (tablesToCompact != null) {
+          for (SSTable ssTable : tablesToCompact) {
+            ssTable.unpin();
           }
-          // Shutdown the executor
-          executor.shutdown();
+        }
+        if (!committed && tablesToCompact != null) {
+          logger.debug("Compaction rolled back; {} input SSTables remain live", tablesToCompact.size());
         }
       }
     } catch (Exception e) {
@@ -147,29 +203,34 @@ public class CompactionService extends AbstractBackgroundService {
     }
   }
 
-  private void commitCompaction(List<SSTable> tablesToCompact, MemTable mergedMemTable)
-      throws IOException {
-    // Create a new SSTable at the output level determined by the compaction strategy
-    int outputLevel = compactionStrategy.getCompactionOutputLevel(tablesToCompact);
-    long newSequenceNumber = sequenceNumber.getAndIncrement();
+  private boolean commitCompaction(
+      List<SSTable> tablesToCompact, SSTable compactedTable, long layoutVersionAtStart) {
+    synchronized (ssTables) {
+      if (layoutVersionSupplier != null
+          && layoutVersionSupplier.getAsLong() != layoutVersionAtStart) {
+        logger.warn("Compaction aborted: storage layout changed during merge");
+        return false;
+      }
+      for (SSTable input : tablesToCompact) {
+        if (!ssTables.contains(input)) {
+          logger.warn("Compaction aborted: input SSTable set changed during merge");
+          return false;
+        }
+      }
 
-    SSTable compactedTable =
-        new SSTable(mergedMemTable, config.dataDirectory(), outputLevel, newSequenceNumber);
-
-    // Add the new SSTable to the list
-    ssTables.add(compactedTable);
-
-    // Remove the old SSTables
-    for (SSTable ssTable : tablesToCompact) {
-      ssTables.remove(ssTable);
-      ssTable.delete(); // Delete the files
-      ssTable.close(); // Release resources
+      ssTables.add(compactedTable);
+      for (SSTable ssTable : tablesToCompact) {
+        ssTables.remove(ssTable);
+      }
     }
 
-    logger.info(
-        "Compaction completed. Created new SSTable at level %d with sequence number %d",
-        outputLevel,
-        newSequenceNumber);
+    if (layoutPublisher != null) {
+      layoutPublisher.publishStorageLayout();
+    }
+    for (SSTable ssTable : tablesToCompact) {
+      ssTable.retire();
+    }
+    return true;
   }
 
   long computeMergeMemTableCapacity(List<SSTable> tablesToCompact) {
@@ -184,39 +245,32 @@ public class CompactionService extends AbstractBackgroundService {
 
   private Map<ByteArrayWrapper, byte[]> mergeSSTableEntries(
       List<SSTable> tablesToCompact, ExecutorService executor) {
-    // Sort by sequence number in descending order (newer first)
     tablesToCompact.sort((a, b) -> Long.compare(b.getSequenceNumber(), a.getSequenceNumber()));
 
-    // Create a map to store the merged key-value pairs
     Map<ByteArrayWrapper, byte[]> mergedData = new HashMap<>();
     List<CompletableFuture<List<Map.Entry<byte[], byte[]>>>> futures = new ArrayList<>();
 
-    // Create a future for each SSTable
     for (SSTable ssTable : tablesToCompact) {
       CompletableFuture<List<Map.Entry<byte[], byte[]>>> future =
           CompletableFuture.supplyAsync(() -> getEntriesFromSSTable(ssTable), executor);
       futures.add(future);
     }
 
-    // Wait for all futures to complete and process the results
     for (int i = 0; i < tablesToCompact.size(); i++) {
       SSTable ssTable = tablesToCompact.get(i);
       try {
         List<Map.Entry<byte[], byte[]>> entries = futures.get(i).get();
 
-        // If no entries are found, log a warning but continue
         if (entries.isEmpty()) {
           logger.warn(
-              "No entries found in SSTable with sequence number %d",
+              "No entries found in SSTable with sequence number {}",
               ssTable.getSequenceNumber());
         }
 
-        // Process the entries
         for (Map.Entry<byte[], byte[]> entry : entries) {
           ByteArrayWrapper key = new ByteArrayWrapper(entry.getKey());
-          // Only add if the key hasn't been seen yet (newer SSTables take precedence)
           if (!mergedData.containsKey(key) && entry.getValue() != null) {
-            mergedData.put(key, entry.getValue()); // Skip tombstones
+            mergedData.put(key, entry.getValue());
           }
         }
       } catch (InterruptedException e) {
@@ -238,8 +292,7 @@ public class CompactionService extends AbstractBackgroundService {
   private boolean loadIntoMemTable(
       MemTable mergedMemTable, Map<ByteArrayWrapper, byte[]> mergedData) {
     for (Map.Entry<ByteArrayWrapper, byte[]> entry : mergedData.entrySet()) {
-      if (!mergedMemTable.put(
-          entry.getKey().getData(), entry.getValue(), 0)) { // No TTL for simplicity
+      if (!mergedMemTable.put(entry.getKey().getData(), entry.getValue(), 0)) {
         return false;
       }
     }
@@ -269,11 +322,7 @@ public class CompactionService extends AbstractBackgroundService {
 
   private List<Map.Entry<byte[], byte[]>> getEntriesFromSSTable(SSTable ssTable) {
     List<Map.Entry<byte[], byte[]>> entries = new ArrayList<>();
-
-    // Get all entries from the SSTable using the getRange method
     Map<byte[], byte[]> rangeEntries = ssTable.getRange(null, null);
-
-    // Convert the map entries to a list
     for (Map.Entry<byte[], byte[]> entry : rangeEntries.entrySet()) {
       if (entry.getValue() != null) {
         entries.add(new AbstractMap.SimpleEntry<>(entry.getKey(), entry.getValue()));

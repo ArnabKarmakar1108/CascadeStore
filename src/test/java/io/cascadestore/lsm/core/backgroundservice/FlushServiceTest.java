@@ -1,6 +1,7 @@
 package io.cascadestore.lsm.core.backgroundservice;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
@@ -12,6 +13,11 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -182,5 +188,62 @@ class FlushServiceTest {
 
     // Clean up
     lowThresholdFlushService.shutdown();
+  }
+
+  @Test
+  void concurrentFlushClaimsMemTableOnce() throws Exception {
+    MemTable memTable = new MemTable(config.memTableMaxSizeBytes());
+    memTable.put("key1".getBytes(), "value1".getBytes(), 0);
+    memTable.makeImmutable();
+    immutableMemTables.add(memTable);
+
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    CountDownLatch ready = new CountDownLatch(2);
+    CountDownLatch go = new CountDownLatch(1);
+
+    for (int i = 0; i < 2; i++) {
+      pool.submit(
+          () -> {
+            ready.countDown();
+            try {
+              go.await();
+              flushService.executeNow();
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+            }
+          });
+    }
+
+    ready.await();
+    go.countDown();
+    pool.shutdown();
+    assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+
+    assertEquals(1, ssTables.size(), "Each MemTable must flush to exactly one SSTable");
+    assertEquals(0, immutableMemTables.size());
+    assertNotNull(ssTables.get(0).get("key1".getBytes()));
+  }
+
+  @Test
+  void testFlushInvokesWalTruncationHook() throws IOException {
+    AtomicBoolean hookCalled = new AtomicBoolean(false);
+    FlushService hookFlushService =
+        new FlushService(
+            immutableMemTables,
+            ssTables,
+            config,
+            sequenceNumber,
+            mockCompactionService,
+            () -> hookCalled.set(true));
+
+    MemTable memTable = new MemTable(config.memTableMaxSizeBytes());
+    memTable.put("key1".getBytes(), "value1".getBytes(), 0);
+    memTable.makeImmutable();
+    immutableMemTables.add(memTable);
+
+    hookFlushService.executeNow();
+
+    assertTrue(hookCalled.get());
+    hookFlushService.shutdown();
   }
 }

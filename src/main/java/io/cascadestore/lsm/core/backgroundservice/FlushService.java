@@ -1,6 +1,8 @@
 package io.cascadestore.lsm.core.backgroundservice;
 
 import io.cascadestore.lsm.config.CascadeConfig;
+import io.cascadestore.lsm.core.store.StorageLayoutPublisher;
+import io.cascadestore.lsm.io.BlockCache;
 import io.cascadestore.lsm.memtable.MemTable;
 import io.cascadestore.lsm.sstable.SSTable;
 import java.io.File;
@@ -17,6 +19,10 @@ public class FlushService extends AbstractBackgroundService {
   private final CascadeConfig config;
   private final AtomicLong sequenceNumber;
   private final CompactionService compactionService;
+  private final Runnable walTruncationHook;
+  private final StorageLayoutPublisher layoutPublisher;
+  private final BlockCache blockCache;
+  private final Object flushMonitor = new Object();
 
   public FlushService(
       List<MemTable> immutableMemTables,
@@ -24,12 +30,63 @@ public class FlushService extends AbstractBackgroundService {
       CascadeConfig config,
       AtomicLong sequenceNumber,
       CompactionService compactionService) {
+    this(immutableMemTables, ssTables, config, sequenceNumber, compactionService, null, null);
+  }
+
+  public FlushService(
+      List<MemTable> immutableMemTables,
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      CompactionService compactionService,
+      Runnable walTruncationHook) {
+    this(
+        immutableMemTables,
+        ssTables,
+        config,
+        sequenceNumber,
+        compactionService,
+        walTruncationHook,
+        null);
+  }
+
+  public FlushService(
+      List<MemTable> immutableMemTables,
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      CompactionService compactionService,
+      Runnable walTruncationHook,
+      StorageLayoutPublisher layoutPublisher) {
+    this(
+        immutableMemTables,
+        ssTables,
+        config,
+        sequenceNumber,
+        compactionService,
+        walTruncationHook,
+        layoutPublisher,
+        null);
+  }
+
+  public FlushService(
+      List<MemTable> immutableMemTables,
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      CompactionService compactionService,
+      Runnable walTruncationHook,
+      StorageLayoutPublisher layoutPublisher,
+      BlockCache blockCache) {
     super("Flush");
     this.immutableMemTables = immutableMemTables;
     this.ssTables = ssTables;
     this.config = config;
     this.sequenceNumber = sequenceNumber;
     this.compactionService = compactionService;
+    this.walTruncationHook = walTruncationHook;
+    this.layoutPublisher = layoutPublisher;
+    this.blockCache = blockCache;
   }
 
   @Override
@@ -39,96 +96,113 @@ public class FlushService extends AbstractBackgroundService {
 
   @Override
   protected void doExecute() {
-    try {
-      List<MemTable> tablesToFlush;
-
-      // Get a snapshot of immutable MemTables to flush
-      synchronized (immutableMemTables) {
-        if (immutableMemTables.isEmpty()) {
-          logger.info("No immutable MemTables to flush");
-          return;
+    synchronized (flushMonitor) {
+      try {
+        List<MemTable> tablesToFlush;
+        synchronized (immutableMemTables) {
+          if (immutableMemTables.isEmpty()) {
+            logger.info("No immutable MemTables to flush");
+            return;
+          }
+          tablesToFlush = new ArrayList<>(immutableMemTables);
         }
-        tablesToFlush = new ArrayList<>(immutableMemTables);
-        logger.info("Found " + tablesToFlush.size() + " immutable MemTables to flush");
-      }
 
-      for (MemTable memTable : tablesToFlush) {
-        try {
-          // Log the MemTable size and entries
-          logger.info(
-              "Flushing MemTable with size: "
-                  + memTable.getSizeBytes()
-                  + " bytes, entries: "
-                  + memTable.getEntries().size());
+        logger.info("Found {} immutable MemTables to flush", tablesToFlush.size());
 
-          // Create a new SSTable from the MemTable
-          long seqNum = sequenceNumber.getAndIncrement();
-          logger.info(
-              "Creating SSTable with sequence number: "
-                  + seqNum
-                  + " in directory: "
-                  + config.dataDirectory());
-
-          // Check if the MemTable is immutable
-          if (!memTable.isImmutable()) {
-            logger.warn("MemTable is not immutable, making it immutable before flushing");
-            memTable.makeImmutable();
-          }
-
-          // Check if the data directory exists
-          File dir = new File(config.dataDirectory());
-          if (!dir.exists()) {
-            logger.warn("Data directory does not exist, creating it: " + config.dataDirectory());
-            dir.mkdirs();
-          }
-
-          SSTable ssTable = new SSTable(memTable, config.dataDirectory(), 0, seqNum);
-
-          // Add the SSTable to the list
-          synchronized (ssTables) {
-            ssTables.add(ssTable);
-            logger.info("Added SSTable to list, total SSTables: " + ssTables.size());
-          }
-
-          // Remove the MemTable from the immutable list
+        for (MemTable memTable : tablesToFlush) {
           synchronized (immutableMemTables) {
-            immutableMemTables.remove(memTable);
-            logger.info(
-                "Removed MemTable from immutable list, remaining: " + immutableMemTables.size());
+            if (!immutableMemTables.contains(memTable)) {
+              continue;
+            }
           }
-
-          // Close the MemTable to release resources
-          memTable.close();
-
-          logger.info("Flushed MemTable to SSTable: " + ssTable.getSequenceNumber());
-
-          // Check if the SSTable files were created
-          String filePrefix = String.format("sst_L%d_S%d", 0, seqNum);
-          File dataFile = new File(config.dataDirectory(), filePrefix + ".data");
-          File indexFile = new File(config.dataDirectory(), filePrefix + ".index");
-          File filterFile = new File(config.dataDirectory(), filePrefix + ".filter");
-
-          logger.info(
-              "SSTable files created: data="
-                  + dataFile.exists()
-                  + ", index="
-                  + indexFile.exists()
-                  + ", filter="
-                  + filterFile.exists());
-        } catch (IOException e) {
-          logger.error("Error flushing MemTable to disk", e);
+          flushMemTable(memTable);
         }
+
+        maybeTruncateWal();
+        maybeTriggerCompaction();
+      } catch (Exception e) {
+        logger.error("Error during MemTable flush", e);
+      }
+    }
+  }
+
+  private void flushMemTable(MemTable memTable) {
+    if (memTable.getEntries().isEmpty()) {
+      synchronized (immutableMemTables) {
+        immutableMemTables.remove(memTable);
+      }
+      memTable.close();
+      logger.info("Skipping flush of empty MemTable");
+      return;
+    }
+
+    long seqNum = sequenceNumber.getAndIncrement();
+
+    logger.info(
+        "Flushing MemTable with size: {} bytes, entries: {}",
+        memTable.getSizeBytes(),
+        memTable.getEntries().size());
+    logger.info(
+        "Creating SSTable with sequence number: {} in directory: {}",
+        seqNum,
+        config.dataDirectory());
+
+    if (!memTable.isImmutable()) {
+      logger.warn("MemTable is not immutable, making it immutable before flushing");
+      memTable.makeImmutable();
+    }
+
+    File dir = new File(config.dataDirectory());
+    if (!dir.exists() && !dir.mkdirs()) {
+      logger.warn("Data directory does not exist and could not be created: {}", config.dataDirectory());
+    }
+
+    try {
+      SSTable ssTable =
+          new SSTable(memTable, config.dataDirectory(), 0, seqNum, blockCache);
+
+      synchronized (immutableMemTables) {
+        synchronized (ssTables) {
+          ssTables.add(ssTable);
+          immutableMemTables.remove(memTable);
+        }
+        logger.info("Added SSTable to list, total SSTables: {}", ssTables.size());
       }
 
-      // Check if compaction is needed
-      synchronized (ssTables) {
-        if (ssTables.size() >= config.compactionThreshold()) {
-          logger.info("Compaction threshold reached, triggering compaction");
-          compactionService.executeNow();
-        }
+      if (layoutPublisher != null) {
+        layoutPublisher.publishStorageLayout();
       }
-    } catch (Exception e) {
-      logger.error("Error during MemTable flush", e);
+
+      memTable.close();
+      logger.info("Flushed MemTable to SSTable: {}", ssTable.getSequenceNumber());
+    } catch (IOException e) {
+      logger.error("Error flushing MemTable to disk", e);
+      SSTable.deleteFiles(config.dataDirectory(), 0, seqNum);
+      requeueMemTable(memTable);
+    }
+  }
+
+  private void requeueMemTable(MemTable memTable) {
+    synchronized (immutableMemTables) {
+      immutableMemTables.add(memTable);
+      logger.info(
+          "Re-queued MemTable for flush retry, pending immutable MemTables: {}",
+          immutableMemTables.size());
+    }
+  }
+
+  private void maybeTruncateWal() {
+    if (walTruncationHook != null) {
+      walTruncationHook.run();
+    }
+  }
+
+  private void maybeTriggerCompaction() {
+    synchronized (ssTables) {
+      if (ssTables.size() >= config.compactionThreshold()) {
+        logger.info("Compaction threshold reached, triggering compaction");
+        compactionService.executeNow();
+      }
     }
   }
 }
