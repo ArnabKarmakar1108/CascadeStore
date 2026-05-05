@@ -1,16 +1,21 @@
 package io.cascadestore.lsm.benchmark.ycsb;
 
+import io.cascadestore.lsm.api.ByteArrayWrapper;
 import io.cascadestore.lsm.api.KeyValueIterator;
 import io.cascadestore.lsm.config.CascadeConfig;
 import io.cascadestore.lsm.core.compaction.CompactionStrategyType;
 import io.cascadestore.lsm.core.store.CascadeStore;
+import io.cascadestore.lsm.io.BlockCache;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Properties;
 import java.util.Set;
 import java.util.stream.Stream;
@@ -22,14 +27,17 @@ import site.ycsb.Status;
 /**
  * YCSB {@link DB} binding for embedded {@link CascadeStore}.
  *
- * <p>All YCSB threads in a run share one {@link CascadeStore} instance per unique configuration
- * key (datadir + engine settings). Configure via properties prefixed with {@code cascadestore.};
- * see {@link CascadeStoreYcsbFactory}.
+ * <p>Operations route to one of {@code cascadestore.shards} independent stores under
+ * {@code <datadir>/shard-N}, enabling multi-threaded YCSB runs without lock contention on a single
+ * LSM tree.
  */
 public class CascadeStoreYcsbClient extends DB {
 
-  private CascadeStore store;
-  private String registryKey;
+  private CascadeStore[] shards;
+  private int shardCount;
+  private String baseRegistryKey;
+  private List<String> shardRegistryKeys;
+  private final Map<String, byte[]> tablePrefixes = new HashMap<>();
 
   @Override
   public void init() throws DBException {
@@ -38,6 +46,11 @@ public class CascadeStoreYcsbClient extends DB {
     boolean resetDataDir =
         Boolean.parseBoolean(
             props.getProperty(CascadeStoreYcsbFactory.PROP_RESET_DATADIR, "true"));
+    shardCount =
+        Integer.parseInt(props.getProperty(CascadeStoreYcsbFactory.PROP_SHARDS, "1"));
+    if (shardCount < 1) {
+      throw new DBException("cascadestore.shards must be >= 1");
+    }
 
     Path dataPath = Path.of(dataDir);
     int memTableMb =
@@ -59,29 +72,28 @@ public class CascadeStoreYcsbClient extends DB {
             props.getProperty(
                 CascadeStoreYcsbFactory.PROP_COMPACTION_STRATEGY, "THRESHOLD"));
 
-    registryKey =
+    int blockCacheBytes =
+        resolveCacheSizeBytes(
+            props,
+            CascadeStoreYcsbFactory.PROP_BLOCK_CACHE_MB,
+            BlockCache.DEFAULT_SIZE_BYTES,
+            shardCount);
+
+    baseRegistryKey =
         buildRegistryKey(
             dataDir,
+            shardCount,
             memTableMb,
             compactionThreshold,
             compactionIntervalMinutes,
             cleanupIntervalMinutes,
             flushIntervalSeconds,
-            strategyType);
-
-    CascadeConfig config =
-        new CascadeConfig(
-            memTableMb * 1024 * 1024,
-            dataDir,
-            compactionThreshold,
-            compactionIntervalMinutes,
-            cleanupIntervalMinutes,
-            flushIntervalSeconds,
-            strategyType);
+            strategyType,
+            blockCacheBytes);
 
     synchronized (SharedCascadeStoreRegistry.class) {
       try {
-        if (resetDataDir && !SharedCascadeStoreRegistry.isOpen(registryKey)) {
+        if (resetDataDir && !isShardGroupOpen(baseRegistryKey, shardCount)) {
           deleteRecursively(dataPath);
         }
         Files.createDirectories(dataPath);
@@ -89,16 +101,39 @@ public class CascadeStoreYcsbClient extends DB {
         throw new DBException("Failed to prepare data directory: " + dataDir, e);
       }
 
-      store = SharedCascadeStoreRegistry.acquire(registryKey, () -> new CascadeStore(config));
+      shards = new CascadeStore[shardCount];
+      shardRegistryKeys = new ArrayList<>(shardCount);
+      for (int shard = 0; shard < shardCount; shard++) {
+        Path shardDir = dataPath.resolve("shard-" + shard);
+        String shardRegistryKey = shardRegistryKey(baseRegistryKey, shard);
+        CascadeConfig config =
+            new CascadeConfig(
+                memTableMb * 1024 * 1024,
+                shardDir.toString(),
+                compactionThreshold,
+                compactionIntervalMinutes,
+                cleanupIntervalMinutes,
+                flushIntervalSeconds,
+                strategyType,
+                blockCacheBytes,
+                true,
+                3);
+        shards[shard] =
+            SharedCascadeStoreRegistry.acquire(shardRegistryKey, () -> new CascadeStore(config));
+        shardRegistryKeys.add(shardRegistryKey);
+      }
     }
   }
 
   @Override
   public void cleanup() throws DBException {
-    if (registryKey != null) {
-      SharedCascadeStoreRegistry.release(registryKey);
-      registryKey = null;
-      store = null;
+    if (shardRegistryKeys != null) {
+      for (String shardRegistryKey : shardRegistryKeys) {
+        SharedCascadeStoreRegistry.release(shardRegistryKey);
+      }
+      shardRegistryKeys = null;
+      shards = null;
+      baseRegistryKey = null;
     }
   }
 
@@ -108,7 +143,8 @@ public class CascadeStoreYcsbClient extends DB {
       String key,
       Set<String> fields,
       Map<String, ByteIterator> result) {
-    byte[] record = store.get(YcsbRecordCodec.storageKey(table, key));
+    byte[] storageKey = toStorageKey(table, key);
+    byte[] record = shardFor(storageKey).get(storageKey);
     if (record == null) {
       return Status.NOT_FOUND;
     }
@@ -123,47 +159,64 @@ public class CascadeStoreYcsbClient extends DB {
       int recordCount,
       Set<String> fields,
       java.util.Vector<HashMap<String, ByteIterator>> result) {
-    byte[] scanStart = YcsbRecordCodec.storageKey(table, startKey);
+    byte[] scanStart = toStorageKey(table, startKey);
     byte[] scanEnd = YcsbRecordCodec.scanEndKey(table);
     String prefix = table + ":";
 
-    try (KeyValueIterator iterator = store.getIterator(scanStart, scanEnd)) {
-      while (iterator.hasNext() && result.size() < recordCount) {
-        Map.Entry<byte[], byte[]> entry = iterator.next();
-        String storageKey = new String(entry.getKey(), StandardCharsets.UTF_8);
-        if (!storageKey.startsWith(prefix)) {
-          continue;
-        }
+    PriorityQueue<ShardScanCursor> cursors =
+        new PriorityQueue<>(Comparator.comparing(cursor -> cursor.nextKey));
 
-        HashMap<String, ByteIterator> record = new HashMap<>();
-        YcsbRecordCodec.decodeInto(entry.getValue(), fields, record);
-        result.add(record);
+    for (int shard = 0; shard < shardCount; shard++) {
+      KeyValueIterator iterator = shards[shard].getIterator(scanStart, scanEnd);
+      ShardScanCursor cursor = ShardScanCursor.advance(shard, iterator, prefix);
+      if (cursor != null) {
+        cursors.add(cursor);
+      } else {
+        iterator.close();
       }
     }
+
+    while (!cursors.isEmpty() && result.size() < recordCount) {
+      ShardScanCursor cursor = cursors.poll();
+      HashMap<String, ByteIterator> record = new HashMap<>();
+      YcsbRecordCodec.decodeInto(cursor.nextValue, fields, record);
+      result.add(record);
+
+      ShardScanCursor next = cursor.advance(prefix);
+      if (next != null) {
+        cursors.add(next);
+      } else {
+        cursor.iterator.close();
+      }
+    }
+
+    while (!cursors.isEmpty()) {
+      cursors.poll().iterator.close();
+    }
+
     return Status.OK;
   }
 
   @Override
   public Status update(String table, String key, Map<String, ByteIterator> values) {
-    byte[] storageKey = YcsbRecordCodec.storageKey(table, key);
-    byte[] existing = store.get(storageKey);
-    if (existing == null) {
-      return Status.NOT_FOUND;
-    }
-    byte[] merged = YcsbRecordCodec.merge(existing, values);
-    return store.put(storageKey, merged) ? Status.OK : Status.ERROR;
+    byte[] storageKey = toStorageKey(table, key);
+    boolean ok =
+        shardFor(storageKey)
+            .merge(storageKey, existing -> YcsbRecordCodec.merge(existing, values));
+    return ok ? Status.OK : Status.NOT_FOUND;
   }
 
   @Override
   public Status insert(String table, String key, Map<String, ByteIterator> values) {
-    byte[] storageKey = YcsbRecordCodec.storageKey(table, key);
+    byte[] storageKey = toStorageKey(table, key);
     byte[] encoded = YcsbRecordCodec.encode(values);
-    return store.put(storageKey, encoded) ? Status.OK : Status.ERROR;
+    return shardFor(storageKey).put(storageKey, encoded) ? Status.OK : Status.ERROR;
   }
 
   @Override
   public Status delete(String table, String key) {
-    return store.delete(YcsbRecordCodec.storageKey(table, key)) ? Status.OK : Status.NOT_FOUND;
+    byte[] storageKey = toStorageKey(table, key);
+    return shardFor(storageKey).delete(storageKey) ? Status.OK : Status.NOT_FOUND;
   }
 
   /** Clears reference-counted stores; for unit tests only. */
@@ -173,21 +226,62 @@ public class CascadeStoreYcsbClient extends DB {
 
   static String buildRegistryKey(
       String dataDir,
+      int shardCount,
       int memTableMb,
       int compactionThreshold,
       double compactionIntervalMinutes,
       int cleanupIntervalMinutes,
       int flushIntervalSeconds,
-      CompactionStrategyType strategyType) {
+      CompactionStrategyType strategyType,
+      int blockCacheBytes) {
     return String.join(
         "|",
         dataDir,
+        Integer.toString(shardCount),
         strategyType.name(),
         Integer.toString(memTableMb),
         Integer.toString(compactionThreshold),
         Double.toString(compactionIntervalMinutes),
         Integer.toString(cleanupIntervalMinutes),
-        Integer.toString(flushIntervalSeconds));
+        Integer.toString(flushIntervalSeconds),
+        Integer.toString(blockCacheBytes));
+  }
+
+  /**
+   * Resolves per-shard cache bytes. Explicit property wins. Otherwise single-shard runs use full
+   * defaults; multi-shard runs divide defaults by shard count so the JVM does not hold N× cache
+   * budget (which caused heavy GC at 250k).
+   */
+  static int resolveCacheSizeBytes(
+      Properties props, String propertyKey, int singleShardDefault, int shardCount) {
+    String explicit = props.getProperty(propertyKey);
+    if (explicit != null && !explicit.isBlank()) {
+      int megabytes = Integer.parseInt(explicit.trim());
+      return megabytes <= 0 ? 0 : megabytes * 1024 * 1024;
+    }
+    if (shardCount <= 1) {
+      return singleShardDefault;
+    }
+    int scaled = singleShardDefault / shardCount;
+    int floor = 8 * 1024 * 1024;
+    return Math.max(floor, scaled);
+  }
+
+  private byte[] toStorageKey(String table, String userKey) {
+    return YcsbRecordCodec.storageKey(
+        tablePrefixes.computeIfAbsent(table, YcsbRecordCodec::tablePrefix), userKey);
+  }
+
+  private CascadeStore shardFor(byte[] storageKey) {
+    return shards[CascadeStoreShardRouter.shardIndex(storageKey, shardCount)];
+  }
+
+  private static String shardRegistryKey(String baseRegistryKey, int shard) {
+    return baseRegistryKey + "|shard-" + shard;
+  }
+
+  private static boolean isShardGroupOpen(String baseRegistryKey, int shardCount) {
+    return SharedCascadeStoreRegistry.isOpen(shardRegistryKey(baseRegistryKey, 0));
   }
 
   private static CompactionStrategyType parseCompactionStrategy(String value) throws DBException {
@@ -212,6 +306,47 @@ public class CascadeStoreYcsbClient extends DB {
       Files.deleteIfExists(path);
     } catch (IOException ignored) {
       // Best effort cleanup for benchmark temp dirs.
+    }
+  }
+
+  private static final class ShardScanCursor {
+    private final int shard;
+    private final KeyValueIterator iterator;
+    private final ByteArrayWrapper nextKey;
+    private final byte[] nextValue;
+
+    private ShardScanCursor(
+        int shard, KeyValueIterator iterator, ByteArrayWrapper nextKey, byte[] nextValue) {
+      this.shard = shard;
+      this.iterator = iterator;
+      this.nextKey = nextKey;
+      this.nextValue = nextValue;
+    }
+
+    private static ShardScanCursor advance(int shard, KeyValueIterator iterator, String prefix) {
+      while (iterator.hasNext()) {
+        Map.Entry<byte[], byte[]> entry = iterator.next();
+        String storageKey = new String(entry.getKey(), StandardCharsets.UTF_8);
+        if (!storageKey.startsWith(prefix)) {
+          continue;
+        }
+        return new ShardScanCursor(
+            shard, iterator, new ByteArrayWrapper(entry.getKey()), entry.getValue());
+      }
+      return null;
+    }
+
+    private ShardScanCursor advance(String prefix) {
+      while (iterator.hasNext()) {
+        Map.Entry<byte[], byte[]> entry = iterator.next();
+        String storageKey = new String(entry.getKey(), StandardCharsets.UTF_8);
+        if (!storageKey.startsWith(prefix)) {
+          continue;
+        }
+        return new ShardScanCursor(
+            shard, iterator, new ByteArrayWrapper(entry.getKey()), entry.getValue());
+      }
+      return null;
     }
   }
 }

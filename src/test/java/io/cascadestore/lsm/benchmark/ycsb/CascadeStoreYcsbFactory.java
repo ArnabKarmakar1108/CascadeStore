@@ -22,6 +22,9 @@ public final class CascadeStoreYcsbFactory {
       "cascadestore.compaction.interval.minutes";
   public static final String PROP_FLUSH_INTERVAL_SECONDS = "cascadestore.flush.interval.seconds";
   public static final String PROP_CLEANUP_INTERVAL_MINUTES = "cascadestore.cleanup.interval.minutes";
+  public static final String PROP_SHARDS = "cascadestore.shards";
+  /** Per-shard block cache size in MiB; 0 disables. Omit to auto-scale by shard count. */
+  public static final String PROP_BLOCK_CACHE_MB = "cascadestore.block.cache.mb";
 
   private CascadeStoreYcsbFactory() {}
 
@@ -36,6 +39,7 @@ public final class CascadeStoreYcsbFactory {
     properties.setProperty(PROP_COMPACTION_INTERVAL_MINUTES, "30");
     properties.setProperty(PROP_FLUSH_INTERVAL_SECONDS, "10");
     properties.setProperty(PROP_CLEANUP_INTERVAL_MINUTES, "1");
+    properties.setProperty(PROP_SHARDS, "1");
     return properties;
   }
 }
