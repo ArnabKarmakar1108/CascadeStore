@@ -6,13 +6,17 @@
 #   ./scripts/run-ycsb-matrix.sh workloada                 # full Workload A
 #   ./scripts/run-ycsb-matrix.sh workloada 1000000 5000000 # custom record/operation counts
 #
-# Optional env: THREADS TARGET TRIALS
+# Optional env: THREADS TARGET TRIALS WARMUP_SECONDS
 # THREADS defaults to 1 (embedded store; avoids synchronization overhead).
+# TRIALS defaults to 3 (F7a median reporting).
+# WARMUP_SECONDS defaults to 30 pause between matrix cells (F7b).
 
 set -euo pipefail
 
 export THREADS="${THREADS:-1}"
 export TARGET="${TARGET:-0}"
+export TRIALS="${TRIALS:-3}"
+export WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_YCSB="${SCRIPT_DIR}/run-ycsb.sh"
@@ -22,7 +26,6 @@ RECORDCOUNT="${2:-}"
 OPERATIONCOUNT="${3:-}"
 STRATEGIES=(THRESHOLD SIZE_TIERED LEVEL_TIERED)
 WORKLOADS=(workloada workloadb workloadc workloadf)
-TRIALS="${TRIALS:-1}"
 
 if [[ -n "${RECORDCOUNT}" ]]; then
   export RECORDCOUNT
@@ -41,6 +44,10 @@ run_cell() {
   echo "############################################"
   DATADIR="/tmp/ycsb-matrix-${workload}-${strategy}-trial${trial}" \
     "${RUN_YCSB}" all "${workload}" "${strategy}"
+  if [[ "${WARMUP_SECONDS}" -gt 0 ]]; then
+    echo "Warmup pause ${WARMUP_SECONDS}s before next cell..."
+    sleep "${WARMUP_SECONDS}"
+  fi
 }
 
 if [[ "${WORKLOAD}" == "matrix" ]]; then

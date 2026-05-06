@@ -7,13 +7,17 @@
 #   ./scripts/run-ycsb.sh all   workloada-dryrun LEVEL_TIERED
 #
 # Optional env:
-#   THREADS=1 (default; single thread avoids store lock contention)
+#   THREADS=1 (default; set THREADS=cascadestore.shards for multi-core runs)
+#   SHARDS=1 (independent CascadeStore instances under <datadir>/shard-N)
 #   TARGET=0 RECORDCOUNT=1000 OPERATIONCOUNT=1000
 #   MEMTABLE_MB=16
 #   COMPACTION_INTERVAL_MINUTES=30  (>= 1: minutes; < 1: seconds)
 #   COMPACTION_THRESHOLD=4          (L0 trigger for LTCS/STCS; file count for THRESHOLD)
 #   FLUSH_INTERVAL_SECONDS=10
-#   DATADIR=/tmp/ycsb-cascade-data RESULTS_DIR=benchmark/results
+#   BLOCK_CACHE_MB=0  (0 disables per-shard block cache)
+#   JAVA_TOOL_OPTIONS=-Xms4G -Xmx8G  (recommended for 1M in ~32GB containers)
+#   YCSB_JVM_OPTS=-XX:+UseG1GC -XX:MaxGCPauseMillis=200  (appended to java invocation)
+#   DATADIR=/tmp/ycsb-cascade-data RESULTS_DIR=benchmark/results SHARDS=4
 
 set -euo pipefail
 
@@ -29,7 +33,7 @@ Usage: $(basename "$0") <load|run|all> <workload> [compaction_strategy]
   compaction_strategy THRESHOLD | SIZE_TIERED | LEVEL_TIERED (default: LEVEL_TIERED)
 
 Environment overrides:
-  THREADS RECORDCOUNT OPERATIONCOUNT TARGET MEMTABLE_MB
+  THREADS RECORDCOUNT OPERATIONCOUNT TARGET MEMTABLE_MB SHARDS
   COMPACTION_INTERVAL_MINUTES COMPACTION_THRESHOLD FLUSH_INTERVAL_SECONDS DATADIR
 EOF
 }
@@ -50,7 +54,10 @@ MEMTABLE_MB="${MEMTABLE_MB:-}"
 COMPACTION_INTERVAL_MINUTES="${COMPACTION_INTERVAL_MINUTES:-}"
 COMPACTION_THRESHOLD="${COMPACTION_THRESHOLD:-}"
 FLUSH_INTERVAL_SECONDS="${FLUSH_INTERVAL_SECONDS:-}"
+BLOCK_CACHE_MB="${BLOCK_CACHE_MB:-}"
+SHARDS="${SHARDS:-1}"
 DATADIR="${DATADIR:-/tmp/ycsb-cascade-${WORKLOAD}-${STRATEGY}}"
+YCSB_JVM_OPTS="${YCSB_JVM_OPTS:--XX:+UseG1GC -XX:MaxGCPauseMillis=200}"
 
 ycsb_setup
 WORKLOAD_FILE="$(resolve_workload_file "${WORKLOAD}")"
@@ -94,8 +101,14 @@ run_phase() {
   if [[ -n "${FLUSH_INTERVAL_SECONDS}" ]]; then
     extra_props+=("-p" "cascadestore.flush.interval.seconds=${FLUSH_INTERVAL_SECONDS}")
   fi
+  if [[ -n "${SHARDS}" ]]; then
+    extra_props+=("-p" "cascadestore.shards=${SHARDS}")
+  fi
+  if [[ -n "${BLOCK_CACHE_MB}" ]]; then
+    extra_props+=("-p" "cascadestore.block.cache.mb=${BLOCK_CACHE_MB}")
+  fi
 
-  java -cp "${YCSB_CP}" site.ycsb.Client "${ycsb_flag}" \
+  java ${YCSB_JVM_OPTS} -cp "${YCSB_CP}" site.ycsb.Client "${ycsb_flag}" \
     -db "${DB_CLASS}" \
     -P "${CASCADE_PROPS}" \
     -P "${WORKLOAD_FILE}" \
