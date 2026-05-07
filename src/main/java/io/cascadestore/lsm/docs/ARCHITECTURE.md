@@ -10,14 +10,18 @@ CascadeStore is a Log-Structured Merge-Tree (LSM-tree) based key-value storage e
 Client.put(key, value, ttl)
   → CascadeStore.put()
     → PutStore.put()
-      → WALImpl.appendPutRecord()         [fsync to disk]
-      → MemTable.put()                    [off-heap ConcurrentSkipListMap]
+      → WALWriterImpl.appendPutRecord()    [buffered write]
+      → WALManagerImpl.noteBytesWritten()  [fsync every 1 MiB + at rotate/switch/truncate]
+      → MemTable.put()                     [off-heap ConcurrentSkipListMap]
         → if full: CascadeStore.switchMemTable()
+          → wal.sync()                     [forced fsync at switch]
           → mark current immutable
           → create new active MemTable
           → FlushService.executeNow()
             → SSTable(memTable, dir, level=0, seqNum)
-              → writes .data + .index + .filter files
+              → writes .data + sparse .index + .filter
+            → atomic: ssTables.add + immutableMemTables.remove
+            → truncateWalIfAllDataFlushed() [when active empty]
 ```
 
 
@@ -27,13 +31,18 @@ Client.put(key, value, ttl)
 ```
 Client.get(key)
   → CascadeStore.get()
-    → GetStore.get()
-      → 1. Active MemTable              [readLock]
-      → 2. Immutable MemTables          [newest first, synchronized]
-      → 3. SSTables                     [newest first, synchronized]
-           → BloomFilter.mightContain() [fast negative]
-           → sparseIndex.floorEntry()   [O(log n) offset lookup]
-           → sequential scan from offset
+    → GetStore.lookup()                    [thread-safe; returns byte[] directly]
+      → memTableLock.readLock()
+        → 1. Active MemTable
+        → synchronized (immutableMemTables) {
+            synchronized (ssTables) {
+              → 2. Immutable MemTables     [newest first]
+              → 3. SSTables                [newest first]
+                   → BloomFilter.mightContain()
+                   → sparseIndex.floorEntry()   [O(log n); ~1 entry / 16 KiB]
+                   → BufferedDataReader scan  [64 KiB window, per-thread]
+            }
+          }
 ```
 
 
@@ -50,6 +59,7 @@ CascadeStore startup
     → replay PutRecords → MemTable.put()
     → replay DeleteRecords → MemTable.delete()
     → update global sequenceNumber
+  → [after flush + empty active memtable] truncateWal()  [delete wal_*.log]
 ```
 
 ---
@@ -62,24 +72,30 @@ CascadeStore startup
 io.cascadestore.lsm
 ├── api/                  Public interfaces (Storage, iterators, ByteArrayWrapper)
 ├── config/               CascadeConfig record
+├── io/                   BufferedDataReader, ReadBuffers (SSTable scan I/O)
 ├── memory/               Off-heap allocator (OffHeapAllocator, DirectBufferAllocator)
 ├── memtable/             MemTable with ConcurrentSkipListMap + off-heap ValueEntry
 ├── sstable/              On-disk SSTable, BloomFilter, sparse index
+│   ├── index/            SparseIndexPolicy, IndexFileManager
 │   ├── data/             DataFileManager (read/write entries)
-│   ├── index/            IndexFileManager (sparse index)
 │   ├── filter/           FilterManager (bloom filter lifecycle)
 │   ├── io/               SSTableIO (file-level flush/load/delete)
 │   └── iterator/         SSTableIteratorFactory
 ├── wal/                  Write-Ahead Log facade
 │   ├── file/             WALFile abstraction
-│   ├── manager/          WAL lifecycle (create/rotate/discover files)
+│   ├── manager/          WAL lifecycle + WalSyncPolicy (group commit)
 │   ├── reader/           WALReader (deserialization)
-│   ├── writer/           WALWriter (serialization + fsync)
+│   ├── writer/           WALWriter (serialization + batched durability)
 │   └── record/           PutRecord, DeleteRecord
 └── core/
     ├── store/            CascadeStore, PutStore, GetStore, DeleteStore
     ├── backgroundservice/ FlushService, CompactionService, CleanupService
     └── compaction/       CompactionStrategy, Threshold, SizeTiered, LevelTiered
+
+YCSB binding (test-jar): io.cascadestore.lsm.benchmark.ycsb
+├── CascadeStoreYcsbClient   Sharded YCSB DB adapter
+├── CascadeStoreShardRouter  hash(key) % shards
+└── SharedCascadeStoreRegistry  reference-counted store per shard
 ```
 
 ---
@@ -165,14 +181,23 @@ Offset 16+   (N bytes): value data
 
 | Class            | Responsibility                                                    |
 | ---------------- | ----------------------------------------------------------------- |
-| `WAL`            | Interface: append, read, delete                                   |
+| `WAL`            | Interface: append, read, delete, sync                           |
 | `WALImpl`        | Facade composing Manager + Reader + Writer                        |
-| `WALWriterImpl`  | Serializes records, writes via FileChannel, fsyncs. Synchronized. |
+| `WALWriterImpl`  | Serializes records; `noteBytesWritten()` for batched fsync. Sync. |
 | `WALReaderImpl`  | Sequential binary read from WAL files                             |
-| `WALManagerImpl` | File lifecycle: create, rotate at 64MB, discover, delete          |
+| `WALManagerImpl` | File lifecycle, rotation at 64MB, `noteBytesWritten`, `sync()`    |
+| `WalSyncPolicy`  | `DEFAULT_SYNC_BATCH_BYTES = 1 MiB` group-commit threshold         |
 | `WALFileImpl`    | FileChannel wrapper for a single WAL file                         |
 | `PutRecord`      | Immutable record with key (cloned), value (cloned), ttl, seqNum   |
 | `DeleteRecord`   | Immutable record with key (cloned), seqNum                        |
+
+### Durability model (group commit)
+
+1. Each append writes to the `FileChannel` buffer (no immediate fsync).
+2. `noteBytesWritten(recordSize)` accumulates bytes; when `>= syncBatchBytes` (1 MiB), calls `sync()` → `force(true)`.
+3. **Forced sync** also at: log rotation, memtable switch, WAL truncation, shutdown.
+
+This trades a small durability window (up to ~1 MiB of writes) for orders-of-magnitude better update throughput. All records remain in the WAL; recovery replays anything not yet truncated.
 
 
 
@@ -214,11 +239,13 @@ Each SSTable produces three files: `sst_L<level>_S<seqNum>.{data,index,filter}`
 **Index File (.index):**
 
 ```
-[Entries — sparse index, one per key]
+[Entries — sparse index]
   4 bytes: keyLength
   N bytes: key
   8 bytes: offset into data file
 ```
+
+Index entries are written every **16 KiB** of `.data` bytes (`SparseIndexPolicy.INDEX_BLOCK_SIZE_BYTES`), plus the **last key** in the table. This keeps RAM and index-file size bounded at million-key scales; lookups scan forward within one block.
 
 **Filter File (.filter):**
 
@@ -257,8 +284,17 @@ remaining: bloom filter bit array
 ### Lookup Path (SSTable.get)
 
 1. `bloomFilter.mightContain(key)` — false → key definitely absent
-2. `sparseIndex.floorEntry(key)` — find closest offset
-3. Sequential scan from that offset in .data file
+2. `sparseIndex.floorEntry(key)` — find closest indexed offset ≤ key
+3. `BufferedDataReader` sequential scan from that offset (64 KiB read-ahead window)
+4. Per-thread `ThreadLocal<BufferedDataReader>` — safe concurrent reads on one SSTable
+
+### BufferedDataReader (`io` package)
+
+| Constant | Value |
+| -------- | ----- |
+| `DEFAULT_BUFFER_SIZE` | 64 KiB |
+
+Refills a sliding window over the data `FileChannel`; `seek`, `readInt`, `readBytes`, `skip` parse records without per-field syscalls.
 
 ### Key Bounds (compaction)
 
@@ -348,6 +384,13 @@ Leveled compaction with adjacent-level merges. Strategy parameters are set on th
 | `CompactionService` | Every 30min | Merge SSTables per configured strategy        |
 | `CleanupService`    | Every 1min  | Remove expired (TTL) entries from MemTables   |
 
+`FlushService` specifics:
+
+- `synchronized (flushMonitor)` — only one flush batch at a time (safe with concurrent `executeNow()`)
+- Memtables stay in `immutableMemTables` **until** SSTable is written
+- **Atomic publish:** `ssTables.add` + `immutableMemTables.remove` under nested list locks
+- Optional `walTruncationHook` after flush when active memtable is empty
+
 
 All extend `AbstractBackgroundService`:
 
@@ -387,8 +430,10 @@ The main entry point implementing `Storage`. Owns all components.
 | Class         | Path                                             |
 | ------------- | ------------------------------------------------ |
 | `PutStore`    | WAL append → MemTable insert                     |
-| `GetStore`    | Active MemTable → Immutable MemTables → SSTables |
+| `GetStore`    | `lookup()`: active → immutable → SSTables (one lock scope) |
 | `DeleteStore` | Existence check → WAL append → tombstone insert  |
+
+`GetStore.lookup(byte[] key)` returns the value or `null`. No shared mutable result field — safe for concurrent YCSB threads. `volatile MemTable activeMemTable` in all three delegates.
 
 
 ---
@@ -428,6 +473,51 @@ delete(key)
 listKeys() / containsKey(key) / size()
 getRange(start, end)
 getIterator(start, end)
-clear() / shutdown()
+clear() / shutdown()   [shutdown flushes, truncates WAL when durable]
 ```
 
+---
+
+## 11. YCSB benchmark sharding
+
+The YCSB binding (`CascadeStoreYcsbClient` in the test-jar) supports horizontal scale-out without making a single `CascadeStore` fully concurrent.
+
+### Configuration
+
+| Property | Default | Purpose |
+| -------- | ------- | ------- |
+| `cascadestore.shards` | `1` | Number of independent `CascadeStore` instances |
+| `cascadestore.datadir` | `/tmp/...` | Parent directory; shards live in `shard-0` … `shard-N-1` |
+| `threadcount` (YCSB) | `1` | Should match `shards` for best scaling |
+
+### Routing
+
+```
+storageKey = table + ":" + userKey
+shardIndex = (Arrays.hashCode(storageKey) & 0x7FFFFFFF) % shardCount
+```
+
+Each shard has its own WAL, memtables, SSTables, and background services. `SharedCascadeStoreRegistry` reference-counts stores per `(datadir, shard, config)` key.
+
+### Scan
+
+Cross-shard `scan` opens one iterator per shard, then k-way merges by key in the YCSB client.
+
+### Scripts
+
+`scripts/run-ycsb.sh` accepts `SHARDS=N` and passes `cascadestore.shards=N`. Example:
+
+```bash
+SHARDS=4 THREADS=4 JAVA_TOOL_OPTIONS="-Xms4G -Xmx8G" ./scripts/run-ycsb.sh all workloada LEVEL_TIERED
+```
+
+See `OPTIMIZATIONS.md` for benchmark results and rationale.
+
+---
+
+## Related docs
+
+| Document | Purpose |
+| -------- | ------- |
+| `DATA_FLOW.md` | End-to-end walkthrough with code |
+| `OPTIMIZATIONS.md` | Problems faced and how each optimization was resolved |
