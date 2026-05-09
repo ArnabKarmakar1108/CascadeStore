@@ -2,7 +2,7 @@
 
 [![Java Version](https://img.shields.io/badge/Java-17-orange.svg)](https://openjdk.java.net/projects/jdk/17/)
 
-CascadeStore is a Java 17 LSM-tree storage engine that keeps hot data in memory, persists mutations through a WAL, and serves reads from sorted on-disk tables. Direct off-heap `ByteBuffer` allocation and a `ConcurrentSkipListMap`-backed MemTable reduce GC overhead while preserving ordered iteration.
+CascadeStore is a Java 17 LSM-tree key-value engine. Writes are buffered in an ordered in-memory table, made durable through a write-ahead log, and eventually flushed into immutable on-disk SSTables. Off-heap value storage, bloom filters, and optional block caching keep heap churn low while reads stay predictable as data grows.
 
 ## Table of Contents
 
@@ -13,41 +13,42 @@ CascadeStore is a Java 17 LSM-tree storage engine that keeps hot data in memory,
 - [Usage](#usage)
 - [Architecture](#architecture)
 - [Performance](#performance)
+- [Documentation](#documentation)
 - [Contributing](#contributing)
 - [Acknowledgements](#acknowledgements)
 
 ## Overview
 
-The project implements the classic LSM pattern: writes land in a mutable MemTable, are appended to a WAL, and are eventually flushed into immutable SSTables. Compaction merges overlapping tables so point lookups and range scans stay bounded as data grows. The design fits append-heavy workloads, event streams, and other write-biased use cases.
+The engine follows the standard LSM lifecycle: mutations land in a mutable MemTable and WAL, immutable MemTables flush to level-0 SSTables, and background compaction rewrites overlapping files so read amplification stays bounded. The design targets write-heavy workloads—event ingestion, caching layers, and append-oriented storage—where sequential disk I/O and batched durability matter more than immediate read consistency across replicas.
 
-Primary components:
-- In-memory MemTable for recent puts and deletes
-- Immutable SSTables stored as separate data, index, and bloom-filter files
-- WAL replay for crash recovery
-- Scheduled flush, compaction, and TTL cleanup services
+Main building blocks:
+
+- **MemTable** — concurrent skip-list index with off-heap value payloads
+- **WAL** — append-only recovery log with batched `fsync`
+- **SSTable** — sorted data files with sparse indexes and bloom filters
+- **Background services** — flush, compaction (three strategies), and TTL cleanup
 
 ## Features
 
-- **Write-optimized path**: Batches mutations in memory before sequential disk writes.
-- **Ordered storage**: Keys remain sorted for efficient range scans and iterators.
-- **Background compaction**: Threshold, size-tiered, or level-tiered policies merge SSTables automatically.
-- **TTL entries**: Optional expiration timestamps on individual keys.
-- **Tombstones**: Explicit delete markers propagate through flush and compaction.
-- **Bloom filters**: Off-heap filters short-circuit negative lookups before disk I/O.
-- **Direct memory**: Native-order direct buffers with explicit cleanup via `Unsafe.invokeCleaner()`.
-- **Concurrency**: `ReentrantReadWriteLock` guards MemTable rotation; skip-list maps support concurrent access.
-- **Parallel compaction reads**: A cached thread pool loads SSTable inputs in parallel during merges.
+- **Durable writes** — WAL group-commit (`fsync` every 1 MiB by default) with forced sync on MemTable rotation
+- **Ordered storage** — keys stay sorted for range scans and merge iterators
+- **Compaction policies** — threshold, size-tiered, or level-tiered background merges
+- **TTL and tombstones** — per-key expiration and delete markers survive flush and compaction
+- **Read optimizations** — bloom filters (0.5% default FPR), sparse indexes (~16 KiB spacing), mmap-backed data reads, optional LRU block cache
+- **Concurrency** — `StorageVersion` snapshots pin SSTables for lock-free reads; parallel bloom probes when many tables are open
+- **Off-heap memory** — direct `ByteBuffer` allocation with explicit cleanup via `Unsafe.invokeCleaner()`
+- **Configurable tuning** — MemTable size, compaction thresholds, block cache size, bloom parallelism via `CascadeConfig`
 
 ## Requirements
 
 - JDK 17 or newer
-- Apache Maven 3.6+ available on your `PATH` (no Maven Wrapper ships with this repo)
+- Apache Maven 3.6+ on your `PATH` (this repo does not ship a Maven Wrapper)
 
 ## Installation
 
 ### Maven dependency
 
-Add the artifact to your application `pom.xml` when published locally or to a repository mirror:
+Add the artifact when published locally or to a repository mirror:
 
 ```xml
 <dependency>
@@ -59,45 +60,36 @@ Add the artifact to your application `pom.xml` when published locally or to a re
 
 ### Build from source
 
-Clone the repository and build with a system Maven install:
-
 ```bash
 git clone https://github.com/ArnabKarmakar1108/CascadeStore.git
 cd CascadeStore
 mvn clean install
 ```
 
-You can also use the provided `Makefile`, which invokes `mvn` directly (`make test`, `make package`, etc.).
+The `Makefile` wraps common Maven targets (`make test`, `make package`, etc.).
 
 ## Usage
 
 ### Basic operations
 
 ```java
-// Default configuration
+// Defaults: 10 MB MemTable, ./data, threshold compaction
 Storage storage = new CascadeStore();
 
-// Custom MemTable size, data directory, and compaction threshold
+// Custom MemTable cap, data directory, and compaction trigger
 Storage storage = new CascadeStore(
-    10 * 1024 * 1024,  // 10 MB MemTable cap
+    10 * 1024 * 1024,  // 10 MB
     "./data",
-    4                  // compact once four SSTables exist at a level
+    4                  // compact when four SSTables accumulate at a level
 );
 
 storage.put("key".getBytes(), "value".getBytes());
-
 byte[] value = storage.get("key".getBytes());
-
 storage.delete("key".getBytes());
-
 boolean present = storage.containsKey("key".getBytes());
-
 List<byte[]> keys = storage.listKeys();
-
 int count = storage.size();
-
 storage.clear();
-
 storage.shutdown();
 ```
 
@@ -112,9 +104,7 @@ Map<byte[], byte[]> slice = storage.getRange(startKey, endKey);
 try (KeyValueIterator iterator = storage.getIterator(startKey, endKey)) {
     while (iterator.hasNext()) {
         Map.Entry<byte[], byte[]> entry = iterator.next();
-        byte[] key = entry.getKey();
-        byte[] value = entry.getValue();
-        // handle entry
+        // use entry.getKey() / entry.getValue()
     }
 }
 ```
@@ -126,37 +116,31 @@ try (KeyValueIterator iterator = storage.getIterator(startKey, endKey)) {
 storage.put("key".getBytes(), "value".getBytes(), 60);
 ```
 
-### Compaction tuning
+### Compaction and tuning
 
-CascadeStore supports three compaction strategies via `CompactionStrategyType`:
+Three compaction strategies are available via `CompactionStrategyType`:
 
-- **THRESHOLD** — compact when a level accumulates enough SSTables (default).
-- **SIZE_TIERED** — group similarly sized SSTables and merge them.
-- **LEVEL_TIERED** — L0 count trigger plus per-level byte budgets; L0 jobs include overlapping L1 files so deeper levels stay non-overlapping.
+| Strategy | Behavior |
+|----------|----------|
+| **THRESHOLD** | Merge when a level holds enough SSTables (default) |
+| **SIZE_TIERED** | Group similarly sized files and compact together |
+| **LEVEL_TIERED** | L0 count trigger plus per-level byte budgets; L0 jobs pull overlapping L1 files |
 
 ```java
-Storage storage = new CascadeStore(
-    10 * 1024 * 1024,
-    "./data",
-    4,
-    CompactionStrategyType.SIZE_TIERED
-);
-
-Storage levelTiered = new CascadeStore(
-    10 * 1024 * 1024,
-    "./data",
-    4,
-    CompactionStrategyType.LEVEL_TIERED
-);
+Storage sizeTiered = new CascadeStore(
+    10 * 1024 * 1024, "./data", 4, CompactionStrategyType.SIZE_TIERED);
 
 CascadeConfig config = new CascadeConfig(
-    10 * 1024 * 1024,
+    256 * 1024 * 1024,  // MemTable
     "./data",
-    4,
-    30,   // compaction check interval (minutes)
-    1,    // TTL cleanup interval (minutes)
-    10,   // flush interval (seconds)
-    CompactionStrategyType.THRESHOLD
+    4,                  // compaction threshold
+    30,                 // compaction check interval (minutes)
+    1,                  // TTL cleanup interval (minutes)
+    10,                 // flush interval (seconds)
+    CompactionStrategyType.LEVEL_TIERED,
+    128 * 1024 * 1024,  // block cache (0 = disabled)
+    true,               // parallel bloom probes
+    3                   // min SSTables before parallel bloom
 );
 Storage tuned = new CascadeStore(config);
 ```
@@ -165,28 +149,50 @@ Storage tuned = new CascadeStore(config);
 
 Package layout under `io.cascadestore.lsm`:
 
-1. **core** — `CascadeStore` orchestrates reads, writes, MemTable rotation, and background services.
-2. **memtable** — `MemTable` stores sorted, off-heap value entries until flush.
-3. **sstable** — `SSTable` handles flush format, bloom filters, sparse indexes, and range access.
-4. **wal** — append-only log types and I/O for durable recovery.
+| Package | Role |
+|---------|------|
+| **core** | `CascadeStore` facade; `PutStore` / `GetStore` / `DeleteStore`; flush, compaction, and TTL services |
+| **memtable** | Active and immutable in-memory tables with off-heap values |
+| **sstable** | On-disk sorted tables: data, sparse index, and bloom filter files |
+| **wal** | Append-only log, rotation, and crash recovery |
+| **io** | Block cache, buffered/mmap data readers, buffer pools |
+| **config** | `CascadeConfig` and compaction strategy types |
 
-See `src/main/java/io/cascadestore/lsm/docs/ARCHITECTURE.md` for a deeper component breakdown.
+Deeper design notes live under `src/main/java/io/cascadestore/lsm/docs/`:
+
+- [ARCHITECTURE.md](src/main/java/io/cascadestore/lsm/docs/ARCHITECTURE.md) — write/read/recovery paths
+- [DATA_FLOW.md](src/main/java/io/cascadestore/lsm/docs/DATA_FLOW.md) — end-to-end data movement
+- [OPTIMIZATIONS.md](src/main/java/io/cascadestore/lsm/docs/OPTIMIZATIONS.md) — implemented performance work
+
+Each major package also has a local README with module-specific detail.
 
 ## Performance
 
-Benchmarks on modern hardware have reported roughly:
+Microbenchmarks (JMH) and macrobenchmarks (YCSB) live under `src/test/java/io/cascadestore/lsm/benchmark/`. See [benchmark/BENCHMARKS.md](benchmark/BENCHMARKS.md) for recorded YCSB results and run matrices.
 
-- ~1M writes/sec for sustained insert workloads
-- ~500K point reads/sec with warm bloom filters
-- Efficient range iteration for small to medium key spans
+Reported throughput depends heavily on hardware, MemTable sizing, compaction pressure, JVM flags, and whether the block cache is enabled. Phase F YCSB Workload A @ 1M (4 shards × 4 threads, block cache off) reached roughly 8–13k ops/s on cold trial-1 runs depending on compaction strategy; warm matrix repeats were significantly higher.
 
-Real numbers depend on disk speed, MemTable sizing, compaction pressure, and key/value sizes.
+Run a quick YCSB smoke test:
+
+```bash
+./scripts/run-ycsb.sh workloada-dryrun
+```
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| [core/README.md](src/main/java/io/cascadestore/lsm/core/README.md) | Store orchestration and background services |
+| [memtable/README.md](src/main/java/io/cascadestore/lsm/memtable/README.md) | In-memory table layout |
+| [sstable/README.md](src/main/java/io/cascadestore/lsm/sstable/README.md) | On-disk format and lookup path |
+| [wal/README.md](src/main/java/io/cascadestore/lsm/wal/README.md) | WAL record format and file lifecycle |
+| [benchmark README](src/test/java/io/cascadestore/lsm/benchmark/README.md) | JMH and YCSB harnesses |
 
 ## Contributing
 
-Issues and pull requests are welcome. Open a discussion or PR on GitHub with a concise description of the change and any test coverage you added.
+Issues and pull requests are welcome. Please include a concise description of the change and any tests you added.
 
 ## Acknowledgements
 
-- The LSM-tree model comes from ["The Log-Structured Merge-Tree (LSM-Tree)"](https://www.cs.umb.edu/~poneil/lsmtree.pdf) by Patrick O'Neil et al.
-- Design cues were taken from LevelDB, RocksDB, Cassandra, and similar open-source LSM engines.
+- LSM-tree foundations: ["The Log-Structured Merge-Tree (LSM-Tree)"](https://www.cs.umb.edu/~poneil/lsmtree.pdf) by Patrick O'Neil et al.
+- Design inspiration from LevelDB, RocksDB, Cassandra, and related open-source engines.
