@@ -14,7 +14,9 @@ public record CascadeConfig(
     CompactionStrategyType compactionStrategyType,
     int blockCacheSizeBytes,
     boolean parallelBloomEnabled,
-    int parallelBloomMinTables) {
+    int parallelBloomMinTables,
+    boolean metricsEnabled,
+    int metricsPort) {
 
   public CascadeConfig(
       int memTableMaxSizeBytes,
@@ -34,7 +36,9 @@ public record CascadeConfig(
         compactionStrategyType,
         BlockCache.DEFAULT_SIZE_BYTES,
         true,
-        3);
+        3,
+        false,
+        9090);
   }
 
   public CascadeConfig(
@@ -56,7 +60,35 @@ public record CascadeConfig(
         compactionStrategyType,
         blockCacheSizeBytes,
         true,
-        3);
+        3,
+        false,
+        9090);
+  }
+
+  public CascadeConfig(
+      int memTableMaxSizeBytes,
+      String dataDirectory,
+      int compactionThreshold,
+      double compactionIntervalMinutes,
+      int cleanupIntervalMinutes,
+      int flushIntervalSeconds,
+      CompactionStrategyType compactionStrategyType,
+      int blockCacheSizeBytes,
+      boolean parallelBloomEnabled,
+      int parallelBloomMinTables) {
+    this(
+        memTableMaxSizeBytes,
+        dataDirectory,
+        compactionThreshold,
+        compactionIntervalMinutes,
+        cleanupIntervalMinutes,
+        flushIntervalSeconds,
+        compactionStrategyType,
+        blockCacheSizeBytes,
+        parallelBloomEnabled,
+        parallelBloomMinTables,
+        false,
+        9090);
   }
 
   public CascadeConfig {
@@ -86,6 +118,9 @@ public record CascadeConfig(
     }
     if (parallelBloomMinTables <= 0) {
       throw new IllegalArgumentException("parallelBloomMinTables must be positive");
+    }
+    if (metricsPort <= 0 || metricsPort > 65535) {
+      throw new IllegalArgumentException("metricsPort must be between 1 and 65535");
     }
   }
 
@@ -127,7 +162,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withDataDirectory(String dataDirectory) {
@@ -141,7 +178,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withCompactionThreshold(int compactionThreshold) {
@@ -155,7 +194,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withCompactionIntervalMinutes(double compactionIntervalMinutes) {
@@ -169,7 +210,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withCleanupIntervalMinutes(int cleanupIntervalMinutes) {
@@ -183,7 +226,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withFlushIntervalSeconds(int flushIntervalSeconds) {
@@ -197,7 +242,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withCompactionStrategyType(CompactionStrategyType compactionStrategyType) {
@@ -211,7 +258,9 @@ public record CascadeConfig(
         compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withBlockCacheSizeBytes(int blockCacheSizeBytes) {
@@ -225,7 +274,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withParallelBloomEnabled(boolean parallelBloomEnabled) {
@@ -239,7 +290,9 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         parallelBloomEnabled,
-        this.parallelBloomMinTables);
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
   }
 
   public CascadeConfig withParallelBloomMinTables(int parallelBloomMinTables) {
@@ -253,6 +306,40 @@ public record CascadeConfig(
         this.compactionStrategyType,
         this.blockCacheSizeBytes,
         this.parallelBloomEnabled,
-        parallelBloomMinTables);
+        parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort);
+  }
+
+  public CascadeConfig withMetricsEnabled(boolean metricsEnabled) {
+    return new CascadeConfig(
+        this.memTableMaxSizeBytes,
+        this.dataDirectory,
+        this.compactionThreshold,
+        this.compactionIntervalMinutes,
+        this.cleanupIntervalMinutes,
+        this.flushIntervalSeconds,
+        this.compactionStrategyType,
+        this.blockCacheSizeBytes,
+        this.parallelBloomEnabled,
+        this.parallelBloomMinTables,
+        metricsEnabled,
+        this.metricsPort);
+  }
+
+  public CascadeConfig withMetricsPort(int metricsPort) {
+    return new CascadeConfig(
+        this.memTableMaxSizeBytes,
+        this.dataDirectory,
+        this.compactionThreshold,
+        this.compactionIntervalMinutes,
+        this.cleanupIntervalMinutes,
+        this.flushIntervalSeconds,
+        this.compactionStrategyType,
+        this.blockCacheSizeBytes,
+        this.parallelBloomEnabled,
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        metricsPort);
   }
 }
