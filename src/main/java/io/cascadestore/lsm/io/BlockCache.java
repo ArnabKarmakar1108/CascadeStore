@@ -1,5 +1,6 @@
 package io.cascadestore.lsm.io;
 
+import io.cascadestore.lsm.metrics.CascadeMetrics;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -18,16 +19,22 @@ public final class BlockCache {
   private static final record Key(long sstableId, long blockOffset) {}
 
   private final int maxBytes;
+  private final CascadeMetrics metrics;
   private final ReadWriteLock lock = new ReentrantReadWriteLock();
   private final LinkedHashMap<Key, byte[]> entries;
   private int currentBytes;
 
   public static BlockCache create(int maxBytes) {
-    return maxBytes > 0 ? new BlockCache(maxBytes) : null;
+    return create(maxBytes, CascadeMetrics.noop());
   }
 
-  private BlockCache(int maxBytes) {
+  public static BlockCache create(int maxBytes, CascadeMetrics metrics) {
+    return maxBytes > 0 ? new BlockCache(maxBytes, metrics) : null;
+  }
+
+  private BlockCache(int maxBytes, CascadeMetrics metrics) {
     this.maxBytes = maxBytes;
+    this.metrics = metrics != null ? metrics : CascadeMetrics.noop();
     this.entries = new LinkedHashMap<>(64, 0.75f, true);
   }
 
@@ -38,10 +45,18 @@ public final class BlockCache {
   public byte[] get(long sstableId, long blockOffset) {
     lock.readLock().lock();
     try {
-      return entries.get(new Key(sstableId, blockOffset));
+      byte[] data = entries.get(new Key(sstableId, blockOffset));
+      if (data != null) {
+        metrics.recordBlockCacheHit();
+      }
+      return data;
     } finally {
       lock.readLock().unlock();
     }
+  }
+
+  public void recordMiss() {
+    metrics.recordBlockCacheMiss();
   }
 
   public void put(long sstableId, long blockOffset, byte[] data) {
@@ -81,6 +96,14 @@ public final class BlockCache {
   }
 
   int sizeBytesForTest() {
+    return currentSizeBytes();
+  }
+
+  int entryCountForTest() {
+    return currentEntryCount();
+  }
+
+  public int currentSizeBytes() {
     lock.readLock().lock();
     try {
       return currentBytes;
@@ -89,7 +112,7 @@ public final class BlockCache {
     }
   }
 
-  int entryCountForTest() {
+  public int currentEntryCount() {
     lock.readLock().lock();
     try {
       return entries.size();

@@ -17,6 +17,7 @@ public class MemTable {
   private final NavigableMap<ByteArrayWrapper, ValueEntry> entries;
   private final OffHeapAllocator allocator;
   private final AtomicLong sizeBytes;
+  private final AtomicLong maxWalSequence;
   private final long maxSizeBytes;
   private volatile boolean immutable;
   private volatile boolean atCapacity;
@@ -97,6 +98,7 @@ public class MemTable {
     this.entries = new ConcurrentSkipListMap<>();
     this.allocator = new DirectBufferAllocator();
     this.sizeBytes = new AtomicLong(0);
+    this.maxWalSequence = new AtomicLong(-1);
     this.maxSizeBytes = maxSizeBytes;
     this.immutable = false;
 
@@ -196,6 +198,17 @@ public class MemTable {
 
   public long getSizeBytes() {
     return sizeBytes.get();
+  }
+
+  public void noteWalSequence(long walSequence) {
+    if (walSequence < 0) {
+      return;
+    }
+    maxWalSequence.accumulateAndGet(walSequence, Math::max);
+  }
+
+  public long maxWalSequence() {
+    return maxWalSequence.get();
   }
 
   public boolean isFull() {

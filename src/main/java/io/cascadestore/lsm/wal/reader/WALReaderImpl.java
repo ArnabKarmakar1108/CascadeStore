@@ -31,14 +31,20 @@ public class WALReaderImpl implements WALReader {
 
   @Override
   public List<Record> readRecords() throws IOException {
+    return readRecordsAfter(-1);
+  }
+
+  @Override
+  public List<Record> readRecordsAfter(long minSequenceExclusive) throws IOException {
     List<Record> records = new ArrayList<>();
 
-    // Find all log files
     List<Path> logFiles = walManager.findLogFiles();
-
-    // Read records from each log file
     for (Path logPath : logFiles) {
-      records.addAll(readRecordsFromFile(logPath.toString()));
+      for (Record record : readRecordsFromFile(logPath.toString())) {
+        if (record.getSequenceNumber() > minSequenceExclusive) {
+          records.add(record);
+        }
+      }
     }
 
     return records;

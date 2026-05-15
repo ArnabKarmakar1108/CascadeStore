@@ -69,6 +69,15 @@ public final class DeleteStore {
     return lastException;
   }
 
+  private void noteWalSequence(long walSequence) {
+    memTableLock.readLock().lock();
+    try {
+      activeMemTable.noteWalSequence(walSequence);
+    } finally {
+      memTableLock.readLock().unlock();
+    }
+  }
+
   public int delete(byte[] key) {
     // Reset last exception
     lastException = null;
@@ -87,7 +96,8 @@ public final class DeleteStore {
     try {
       // Log the operation to WAL first (unless we're recovering)
       if (!recovering.get()) {
-        wal.appendDeleteRecord(key);
+        long walSequence = wal.appendDeleteRecord(key);
+        noteWalSequence(walSequence);
       }
 
       // Try to delete in the active MemTable

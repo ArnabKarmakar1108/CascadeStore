@@ -4,6 +4,7 @@ import io.cascadestore.lsm.config.CascadeConfig;
 import io.cascadestore.lsm.core.store.StorageLayoutPublisher;
 import io.cascadestore.lsm.io.BlockCache;
 import io.cascadestore.lsm.memtable.MemTable;
+import io.cascadestore.lsm.metrics.CascadeMetrics;
 import io.cascadestore.lsm.sstable.SSTable;
 import java.io.File;
 import java.io.IOException;
@@ -11,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 public class FlushService extends AbstractBackgroundService {
 
@@ -22,6 +24,8 @@ public class FlushService extends AbstractBackgroundService {
   private final Runnable walTruncationHook;
   private final StorageLayoutPublisher layoutPublisher;
   private final BlockCache blockCache;
+  private final CascadeMetrics metrics;
+  private final Consumer<MemTable> onMemTableFlushed;
   private final Object flushMonitor = new Object();
 
   public FlushService(
@@ -78,6 +82,53 @@ public class FlushService extends AbstractBackgroundService {
       Runnable walTruncationHook,
       StorageLayoutPublisher layoutPublisher,
       BlockCache blockCache) {
+    this(
+        immutableMemTables,
+        ssTables,
+        config,
+        sequenceNumber,
+        compactionService,
+        walTruncationHook,
+        layoutPublisher,
+        blockCache,
+        CascadeMetrics.noop(),
+        null);
+  }
+
+  public FlushService(
+      List<MemTable> immutableMemTables,
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      CompactionService compactionService,
+      Runnable walTruncationHook,
+      StorageLayoutPublisher layoutPublisher,
+      BlockCache blockCache,
+      CascadeMetrics metrics) {
+    this(
+        immutableMemTables,
+        ssTables,
+        config,
+        sequenceNumber,
+        compactionService,
+        walTruncationHook,
+        layoutPublisher,
+        blockCache,
+        metrics,
+        null);
+  }
+
+  public FlushService(
+      List<MemTable> immutableMemTables,
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      CompactionService compactionService,
+      Runnable walTruncationHook,
+      StorageLayoutPublisher layoutPublisher,
+      BlockCache blockCache,
+      CascadeMetrics metrics,
+      Consumer<MemTable> onMemTableFlushed) {
     super("Flush");
     this.immutableMemTables = immutableMemTables;
     this.ssTables = ssTables;
@@ -87,6 +138,8 @@ public class FlushService extends AbstractBackgroundService {
     this.walTruncationHook = walTruncationHook;
     this.layoutPublisher = layoutPublisher;
     this.blockCache = blockCache;
+    this.metrics = metrics != null ? metrics : CascadeMetrics.noop();
+    this.onMemTableFlushed = onMemTableFlushed;
   }
 
   @Override
@@ -157,6 +210,9 @@ public class FlushService extends AbstractBackgroundService {
       logger.warn("Data directory does not exist and could not be created: {}", config.dataDirectory());
     }
 
+    long flushBytes = memTable.getSizeBytes();
+    long flushStart = System.nanoTime();
+
     try {
       SSTable ssTable =
           new SSTable(memTable, config.dataDirectory(), 0, seqNum, blockCache);
@@ -173,7 +229,12 @@ public class FlushService extends AbstractBackgroundService {
         layoutPublisher.publishStorageLayout();
       }
 
+      if (onMemTableFlushed != null) {
+        onMemTableFlushed.accept(memTable);
+      }
+
       memTable.close();
+      metrics.recordFlush(System.nanoTime() - flushStart, flushBytes);
       logger.info("Flushed MemTable to SSTable: {}", ssTable.getSequenceNumber());
     } catch (IOException e) {
       logger.error("Error flushing MemTable to disk", e);
@@ -199,7 +260,9 @@ public class FlushService extends AbstractBackgroundService {
 
   private void maybeTriggerCompaction() {
     synchronized (ssTables) {
-      if (ssTables.size() >= config.compactionThreshold()) {
+      boolean pending = ssTables.size() >= config.compactionThreshold();
+      metrics.setCompactionPending(pending);
+      if (pending) {
         logger.info("Compaction threshold reached, triggering compaction");
         compactionService.executeNow();
       }

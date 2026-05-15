@@ -2,6 +2,8 @@ package io.cascadestore.lsm.wal;
 
 import io.cascadestore.lsm.wal.manager.WALManager;
 import io.cascadestore.lsm.wal.manager.WALManagerImpl;
+import io.cascadestore.lsm.wal.manager.WalSyncPolicy;
+import io.cascadestore.lsm.metrics.CascadeMetrics;
 import io.cascadestore.lsm.wal.reader.WALReader;
 import io.cascadestore.lsm.wal.reader.WALReaderImpl;
 import io.cascadestore.lsm.wal.record.Record;
@@ -25,11 +27,16 @@ public class WALImpl implements WAL {
   private boolean closed;
 
   public WALImpl(String directory) throws IOException {
-    this(directory, 64 * 1024 * 1024); // Default 64MB max log size
+    this(directory, 64 * 1024 * 1024, CascadeMetrics.noop());
   }
 
   public WALImpl(String directory, long maxLogSizeBytes) throws IOException {
-    this.manager = new WALManagerImpl(directory, maxLogSizeBytes);
+    this(directory, maxLogSizeBytes, CascadeMetrics.noop());
+  }
+
+  public WALImpl(String directory, long maxLogSizeBytes, CascadeMetrics metrics)
+      throws IOException {
+    this.manager = new WALManagerImpl(directory, maxLogSizeBytes, WalSyncPolicy.DEFAULT_SYNC_BATCH_BYTES, metrics);
     this.reader = new WALReaderImpl(manager);
     this.writer = new WALWriterImpl(manager);
 
@@ -76,7 +83,32 @@ public class WALImpl implements WAL {
 
   @Override
   public List<Record> readRecords() throws IOException {
-    return reader.readRecords();
+    writeLock.readLock().lock();
+    try {
+      return reader.readRecords();
+    } finally {
+      writeLock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public List<Record> readRecordsAfter(long minSequenceExclusive) throws IOException {
+    writeLock.readLock().lock();
+    try {
+      return reader.readRecordsAfter(minSequenceExclusive);
+    } finally {
+      writeLock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public void purgeThrough(long maxSequenceInclusive) throws IOException {
+    writeLock.writeLock().lock();
+    try {
+      manager.purgeThrough(maxSequenceInclusive);
+    } finally {
+      writeLock.writeLock().unlock();
+    }
   }
 
   @Override

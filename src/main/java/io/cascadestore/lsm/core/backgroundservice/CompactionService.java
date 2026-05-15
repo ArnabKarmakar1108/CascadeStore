@@ -10,6 +10,7 @@ import io.cascadestore.lsm.core.compaction.ThresholdCompactionStrategy;
 import io.cascadestore.lsm.core.store.StorageLayoutPublisher;
 import io.cascadestore.lsm.io.BlockCache;
 import io.cascadestore.lsm.memtable.MemTable;
+import io.cascadestore.lsm.metrics.CascadeMetrics;
 import io.cascadestore.lsm.sstable.SSTable;
 import java.io.IOException;
 import java.util.AbstractMap;
@@ -36,6 +37,7 @@ public class CompactionService extends AbstractBackgroundService {
   private final StorageLayoutPublisher layoutPublisher;
   private final BlockCache blockCache;
   private final LongSupplier layoutVersionSupplier;
+  private final CascadeMetrics metrics;
 
   public CompactionService(
       List<SSTable> ssTables, CascadeConfig config, AtomicLong sequenceNumber) {
@@ -66,6 +68,17 @@ public class CompactionService extends AbstractBackgroundService {
       StorageLayoutPublisher layoutPublisher,
       BlockCache blockCache,
       LongSupplier layoutVersionSupplier) {
+    this(ssTables, config, sequenceNumber, layoutPublisher, blockCache, layoutVersionSupplier, CascadeMetrics.noop());
+  }
+
+  public CompactionService(
+      List<SSTable> ssTables,
+      CascadeConfig config,
+      AtomicLong sequenceNumber,
+      StorageLayoutPublisher layoutPublisher,
+      BlockCache blockCache,
+      LongSupplier layoutVersionSupplier,
+      CascadeMetrics metrics) {
     super("Compaction");
     this.ssTables = ssTables;
     this.config = config;
@@ -74,6 +87,7 @@ public class CompactionService extends AbstractBackgroundService {
     this.layoutPublisher = layoutPublisher;
     this.blockCache = blockCache;
     this.layoutVersionSupplier = layoutVersionSupplier;
+    this.metrics = metrics != null ? metrics : CascadeMetrics.noop();
   }
 
   private CompactionStrategy createCompactionStrategy(CascadeConfig config) {
@@ -96,6 +110,9 @@ public class CompactionService extends AbstractBackgroundService {
   protected void doExecute() {
     List<SSTable> tablesToCompact = null;
     long layoutVersionAtStart = -1;
+    long compactionStart = System.nanoTime();
+    long inputBytes = 0;
+    metrics.setCompactionInProgress(true);
     try {
       synchronized (ssTables) {
         if (!compactionStrategy.shouldCompact(ssTables)) {
@@ -112,6 +129,7 @@ public class CompactionService extends AbstractBackgroundService {
         }
 
         tablesToCompact = new ArrayList<>(tablesToCompact);
+        inputBytes = totalInputBytes(tablesToCompact);
         if (layoutVersionSupplier != null) {
           layoutVersionAtStart = layoutVersionSupplier.getAsLong();
         }
@@ -177,6 +195,8 @@ public class CompactionService extends AbstractBackgroundService {
         }
         committed = true;
 
+        metrics.recordCompaction(System.nanoTime() - compactionStart, inputBytes);
+        metrics.setCompactionPending(ssTables.size() >= config.compactionThreshold());
         logger.info(
             "Compaction completed. Created new SSTable at level {} with sequence number {}",
             outputLevel,
@@ -200,7 +220,17 @@ public class CompactionService extends AbstractBackgroundService {
       }
     } catch (Exception e) {
       logger.error("Error during compaction", e);
+    } finally {
+      metrics.setCompactionInProgress(false);
     }
+  }
+
+  private static long totalInputBytes(List<SSTable> tables) {
+    long bytes = 0;
+    for (SSTable table : tables) {
+      bytes += table.getSizeBytes();
+    }
+    return bytes;
   }
 
   private boolean commitCompaction(

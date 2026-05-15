@@ -17,6 +17,10 @@ public interface WALManager {
 
   void deleteAllLogs() throws IOException;
 
+  void purgeThrough(long maxSequenceInclusive) throws IOException;
+
+  long recoverSequenceCounter() throws IOException;
+
   String getDirectory();
 
   long getMaxLogSizeBytes();

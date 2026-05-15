@@ -88,6 +88,15 @@ public final class MergeStore {
     return lastException;
   }
 
+  private void noteWalSequence(long walSequence) {
+    memTableLock.readLock().lock();
+    try {
+      activeMemTable.noteWalSequence(walSequence);
+    } finally {
+      memTableLock.readLock().unlock();
+    }
+  }
+
   public int merge(byte[] key, ValueMerger merger) {
     lastException = null;
 
@@ -114,7 +123,8 @@ public final class MergeStore {
 
     try {
       if (!recovering.get()) {
-        wal.appendPutRecord(key, merged, 0);
+        long walSequence = wal.appendPutRecord(key, merged, 0);
+        noteWalSequence(walSequence);
       }
       return putInMemTable(key, merged, 0);
     } catch (IOException e) {

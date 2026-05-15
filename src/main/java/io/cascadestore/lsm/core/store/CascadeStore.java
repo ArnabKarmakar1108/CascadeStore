@@ -10,7 +10,11 @@ import io.cascadestore.lsm.core.backgroundservice.CompactionService;
 import io.cascadestore.lsm.core.backgroundservice.FlushService;
 import io.cascadestore.lsm.core.compaction.CompactionStrategyType;
 import io.cascadestore.lsm.io.BlockCache;
+import io.cascadestore.lsm.manifest.Manifest;
+import io.cascadestore.lsm.manifest.ManifestStore;
 import io.cascadestore.lsm.memtable.MemTable;
+import io.cascadestore.lsm.metrics.CascadeMetrics;
+import io.cascadestore.lsm.metrics.PrometheusHttpServer;
 import io.cascadestore.lsm.sstable.SSTable;
 import io.cascadestore.lsm.wal.WAL;
 import io.cascadestore.lsm.wal.WALImpl;
@@ -30,6 +34,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -58,8 +63,13 @@ public class CascadeStore implements Storage {
   private volatile StorageVersion storageVersion;
   private final AtomicBoolean recovering;
 
+  private final ManifestStore manifestStore;
+  private final AtomicLong flushedWalSequence;
+
   // Background services
   private final BlockCache blockCache;
+  private final CascadeMetrics metrics;
+  private final PrometheusHttpServer metricsServer;
   private final CompactionService compactionService;
   private final CleanupService cleanupService;
   private final FlushService flushService;
@@ -117,6 +127,8 @@ public class CascadeStore implements Storage {
     this.layoutVersionId = new AtomicLong(0);
     this.storageVersion = StorageVersion.empty(0);
     this.recovering = new AtomicBoolean(false);
+    this.manifestStore = new ManifestStore(config.dataDirectory());
+    this.flushedWalSequence = new AtomicLong(-1);
 
     // Create data directory if it doesn't exist
     File dir = new File(config.dataDirectory());
@@ -124,10 +136,21 @@ public class CascadeStore implements Storage {
       dir.mkdirs();
     }
 
-    this.blockCache = BlockCache.create(config.blockCacheSizeBytes());
+    this.metrics = config.metricsEnabled() ? CascadeMetrics.create() : CascadeMetrics.noop();
+    PrometheusHttpServer startedMetricsServer = null;
+    if (config.metricsEnabled()) {
+      try {
+        startedMetricsServer = new PrometheusHttpServer(config.metricsPort(), metrics.registry());
+      } catch (IOException e) {
+        logger.error("Failed to start Prometheus metrics server on port {}", config.metricsPort(), e);
+      }
+    }
+    this.metricsServer = startedMetricsServer;
 
-    // Load existing SSTables from disk
-    loadSSTables();
+    this.blockCache = BlockCache.create(config.blockCacheSizeBytes(), metrics);
+
+    // Load existing SSTables (MANIFEST-first, directory scan fallback)
+    loadStorageFromDisk();
 
     // Create WAL directory
     String walDirectory = Paths.get(config.dataDirectory(), "wal").toString();
@@ -135,7 +158,7 @@ public class CascadeStore implements Storage {
       Files.createDirectories(Paths.get(walDirectory));
 
       // Initialize WAL
-      this.wal = new WALImpl(walDirectory);
+      this.wal = new WALImpl(walDirectory, 64 * 1024 * 1024, metrics);
 
       // Recover from WAL if it exists
       recover();
@@ -151,7 +174,8 @@ public class CascadeStore implements Storage {
             sequenceNumber,
             this::publishStorageLayout,
             blockCache,
-            layoutVersionId::get);
+            layoutVersionId::get,
+            metrics);
     this.cleanupService =
         new CleanupService(activeMemTable, immutableMemTables, memTableLock, config);
     this.flushService =
@@ -163,7 +187,9 @@ public class CascadeStore implements Storage {
             compactionService,
             this::truncateWalIfAllDataFlushed,
             this::publishStorageLayout,
-            blockCache);
+            blockCache,
+            metrics,
+            this::onMemTableFlushed);
 
     // Start background services
     compactionService.start();
@@ -171,7 +197,7 @@ public class CascadeStore implements Storage {
     flushService.start();
 
     // Initialize operation stores
-    putStore = new PutStore(activeMemTable, memTableLock, wal, recovering);
+    putStore = new PutStore(activeMemTable, memTableLock, wal, recovering, metrics);
 
     getStore =
         new GetStore(
@@ -179,7 +205,8 @@ public class CascadeStore implements Storage {
             storageVersion,
             memTableLock,
             config.parallelBloomEnabled(),
-            config.parallelBloomMinTables());
+            config.parallelBloomMinTables(),
+            metrics);
 
     deleteStore = new DeleteStore(activeMemTable, memTableLock, wal, recovering, getStore);
 
@@ -207,11 +234,99 @@ public class CascadeStore implements Storage {
       previous.release();
     }
     getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
+    refreshStorageMetrics();
+    try {
+      persistManifest();
+    } catch (IOException e) {
+      logger.warn("Failed to persist MANIFEST after storage layout change", e);
+    }
+  }
+
+  private void refreshStorageMetrics() {
+    if (!metrics.isEnabled()) {
+      return;
+    }
+
+    long memtableBytes = activeMemTable.getSizeBytes();
+    long memtableEntries = activeMemTable.getEntries().size();
+    int immutablePending;
+    synchronized (immutableMemTables) {
+      immutablePending = immutableMemTables.size();
+      for (MemTable memTable : immutableMemTables) {
+        memtableBytes += memTable.getSizeBytes();
+        memtableEntries += memTable.getEntries().size();
+      }
+    }
+    metrics.setMemtableState(memtableBytes, memtableEntries, immutablePending);
+
+    Map<Integer, Integer> countsByLevel = new HashMap<>();
+    synchronized (ssTables) {
+      for (SSTable ssTable : ssTables) {
+        countsByLevel.merge(ssTable.getLevel(), 1, Integer::sum);
+      }
+      metrics.setSstableCountByLevel(countsByLevel);
+      metrics.setCompactionPending(ssTables.size() >= config.compactionThreshold());
+    }
+
+    if (blockCache != null) {
+      metrics.setBlockCacheState(blockCache.currentSizeBytes(), blockCache.currentEntryCount());
+    }
+  }
+
+  public CascadeMetrics metrics() {
+    return metrics;
+  }
+
+  public int metricsPort() {
+    return metricsServer != null ? metricsServer.getPort() : -1;
   }
 
 
   // Initialization and Recovery
-  private void loadSSTables() {
+  private void loadStorageFromDisk() {
+    try {
+      Optional<Manifest> manifest = manifestStore.load();
+      if (manifest.isPresent()) {
+        flushedWalSequence.set(manifest.get().flushedWalSequence());
+        loadSSTablesFromManifest(manifest.get());
+        return;
+      }
+    } catch (IOException e) {
+      logger.warn("Failed to load MANIFEST, falling back to directory scan", e);
+    }
+
+    loadSSTablesFromDirectory();
+  }
+
+  private void loadSSTablesFromManifest(Manifest manifest) {
+    logger.info(
+        "Loading {} SSTables from MANIFEST (flushed_wal_sequence={})",
+        manifest.sstables().size(),
+        manifest.flushedWalSequence());
+
+    for (Manifest.SSTableRef ref : manifest.sstables()) {
+      File dataFile = new File(config.dataDirectory(), ref.fileBaseName() + ".data");
+      if (!dataFile.exists()) {
+        logger.warn("MANIFEST references missing SSTable file: {}", dataFile.getName());
+        continue;
+      }
+
+      try {
+        SSTable ssTable =
+            new SSTable(config.dataDirectory(), ref.level(), ref.sequenceNumber(), blockCache);
+        ssTables.add(ssTable);
+        sequenceNumber.updateAndGet(current -> Math.max(current, ref.sequenceNumber() + 1));
+        logger.info("Loaded SSTable from MANIFEST: {}", ref.fileBaseName());
+      } catch (Exception e) {
+        logger.error("Error loading SSTable from MANIFEST: {}", ref.fileBaseName(), e);
+      }
+    }
+
+    ssTables.sort((a, b) -> Long.compare(b.getSequenceNumber(), a.getSequenceNumber()));
+    logger.info("Loaded {} SSTables from MANIFEST", ssTables.size());
+  }
+
+  private void loadSSTablesFromDirectory() {
     File dataDir = new File(config.dataDirectory());
     File[] files = dataDir.listFiles((dir, name) -> name.endsWith(".data"));
 
@@ -250,36 +365,59 @@ public class CascadeStore implements Storage {
       }
     }
 
-    // Sort SSTables by sequence number (newest first)
     ssTables.sort((a, b) -> Long.compare(b.getSequenceNumber(), a.getSequenceNumber()));
     logger.info("Loaded " + ssTables.size() + " SSTables from disk");
   }
 
+  void onMemTableFlushed(MemTable memTable) {
+    long maxWalSequence = memTable.maxWalSequence();
+    if (maxWalSequence >= 0) {
+      flushedWalSequence.updateAndGet(current -> Math.max(current, maxWalSequence));
+    }
+
+    try {
+      persistManifest();
+      if (wal != null) {
+        wal.sync();
+        wal.purgeThrough(flushedWalSequence.get());
+      }
+      logger.info("Advanced WAL checkpoint to sequence {}", flushedWalSequence.get());
+    } catch (IOException e) {
+      logger.warn("Failed to update WAL checkpoint after flush", e);
+    }
+  }
+
+  private void persistManifest() throws IOException {
+    List<Manifest.SSTableRef> refs = new ArrayList<>();
+    synchronized (ssTables) {
+      for (SSTable ssTable : ssTables) {
+        refs.add(new Manifest.SSTableRef(ssTable.getLevel(), ssTable.getSequenceNumber()));
+      }
+    }
+    manifestStore.save(new Manifest(flushedWalSequence.get(), refs));
+  }
+
   private void recover() {
     try {
-      // Set recovering flag to true
       recovering.set(true);
 
-      // Read all records from the WAL
-      List<Record> records = wal.readRecords();
+      long checkpoint = flushedWalSequence.get();
+      List<Record> records = wal.readRecordsAfter(checkpoint);
 
       if (records.isEmpty()) {
-        logger.info("No WAL records to recover");
+        logger.info("No WAL records to recover after checkpoint {}", checkpoint);
         return;
       }
 
-      logger.info("Recovering {} records from WAL", records.size());
+      logger.info("Recovering {} WAL records after checkpoint {}", records.size(), checkpoint);
 
-      // Sort records by sequence number to ensure correct order
       records.sort((r1, r2) -> Long.compare(r1.getSequenceNumber(), r2.getSequenceNumber()));
 
-      // Update sequence number to be greater than the highest in the WAL
       if (!records.isEmpty()) {
         long maxSeqNum = records.get(records.size() - 1).getSequenceNumber();
-        sequenceNumber.set(maxSeqNum + 1);
+        sequenceNumber.updateAndGet(current -> Math.max(current, maxSeqNum + 1));
       }
 
-      // Replay records
       for (Record record : records) {
         if (record instanceof PutRecord putRecord) {
           activeMemTable.put(putRecord.getKey(), putRecord.getValue(), putRecord.getTtlSeconds());
@@ -330,8 +468,10 @@ public class CascadeStore implements Storage {
     }
     try {
       wal.sync();
-      wal.deleteAllLogs();
-      logger.info("WAL truncated; memtable state is durable in SSTables");
+      wal.purgeThrough(flushedWalSequence.get());
+      logger.info(
+          "WAL truncated through checkpoint {}; memtable state is durable in SSTables",
+          flushedWalSequence.get());
     } catch (IOException e) {
       logger.warn("Failed to truncate WAL", e);
     }
@@ -580,15 +720,17 @@ public class CascadeStore implements Storage {
       ssTables.clear();
     }
 
-    // Reset sequence number
+    // Reset sequence number and WAL checkpoint
     sequenceNumber.set(0);
     layoutVersionId.set(0);
+    flushedWalSequence.set(-1);
 
     // Delete all WAL files
     try {
       wal.deleteAllLogs();
+      persistManifest();
     } catch (IOException e) {
-      logger.error("Error deleting WAL files", e);
+      logger.error("Error deleting WAL files or MANIFEST", e);
     }
 
     // Update the GetStore and PutStore with the new state
@@ -899,6 +1041,10 @@ public class CascadeStore implements Storage {
       }
 
       logger.info("CascadeStore shutdown completed");
+
+      if (metricsServer != null) {
+        metricsServer.close();
+      }
     } catch (InterruptedException e) {
       flushService.shutdownNow();
       compactionService.shutdownNow();

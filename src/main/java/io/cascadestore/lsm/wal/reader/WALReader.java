@@ -8,5 +8,7 @@ public interface WALReader {
 
   List<Record> readRecords() throws IOException;
 
+  List<Record> readRecordsAfter(long minSequenceExclusive) throws IOException;
+
   List<Record> readRecordsFromFile(String filePath) throws IOException;
 }

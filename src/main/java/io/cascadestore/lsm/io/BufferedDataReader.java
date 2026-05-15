@@ -217,6 +217,7 @@ public final class BufferedDataReader implements AutoCloseable {
         schedulePrefetchAfter(bufferEnd);
         return;
       }
+      blockCache.recordMiss();
     }
 
     buffer.clear();

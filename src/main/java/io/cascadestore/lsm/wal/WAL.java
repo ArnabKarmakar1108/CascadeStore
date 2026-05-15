@@ -12,7 +12,11 @@ public interface WAL extends AutoCloseable {
 
   List<Record> readRecords() throws IOException;
 
+  List<Record> readRecordsAfter(long minSequenceExclusive) throws IOException;
+
   void deleteAllLogs() throws IOException;
+
+  void purgeThrough(long maxSequenceInclusive) throws IOException;
 
   void sync() throws IOException;
 
