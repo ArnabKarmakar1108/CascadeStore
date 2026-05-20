@@ -22,8 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_YCSB="${SCRIPT_DIR}/run-ycsb.sh"
 
 WORKLOAD="${1:-workloada-dryrun}"
-RECORDCOUNT="${2:-}"
-OPERATIONCOUNT="${3:-}"
+RECORDCOUNT="${2:-${RECORDCOUNT:-}}"
+OPERATIONCOUNT="${3:-${OPERATIONCOUNT:-}}"
 STRATEGIES=(THRESHOLD SIZE_TIERED LEVEL_TIERED)
 WORKLOADS=(workloada workloadb workloadc workloadf)
 

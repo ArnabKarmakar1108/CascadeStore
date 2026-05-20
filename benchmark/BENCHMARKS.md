@@ -20,9 +20,11 @@ Full comparison grid to populate over time:
 | | THRESHOLD | SIZE_TIERED | LEVEL_TIERED |
 |---|-----------|-------------|--------------|
 | **Workload A** (50/50 R/U, zipfian) | ☑ | ☑ | ☑ |
-| **Workload B** (95/5 R/U, zipfian) | ☐ | ☐ | ☐ |
-| **Workload C** (100% read, latest) | ☐ | ☐ | ☐ |
-| **Workload F** (50/50 RMW, zipfian) | ☐ | ☐ | ☐ |
+| **Workload B** (95/5 R/U, zipfian) | ☑ | ☑ | ☑ |
+| **Workload C** (100% read, latest) | ☑ | ☑ | ☑ |
+| **Workload F** (50/50 RMW, zipfian) | ☑ | ☑ | ☑ |
+
+@10k + @100k (Phase F, Jul 25). All four workloads benchmarked at standard scale.
 
 **Scales:** 1k (smoke) → **10k** (dry) → **100k** (standard) → **250k** (pre-1M gate) → **1M** (large) → beyond TBD
 
@@ -45,6 +47,14 @@ Full comparison grid to populate over time:
 ```bash
 THREADS=1 MEMTABLE_MB=256 COMPACTION_THRESHOLD=4 RECORDCOUNT=1000000 OPERATIONCOUNT=1000000 \
   ./scripts/run-ycsb-matrix.sh workloada 1000000 1000000
+```
+
+**Run workloads B/C/F (10k or 100k):**
+
+```bash
+./scripts/run-ycsb-workloads-bcf.sh 10000          # 10k smoke
+RECORDCOUNT=100000 OPERATIONCOUNT=100000 TRIALS=3 \
+  ./scripts/run-ycsb-workloads-bcf.sh 100000      # 100k standard
 ```
 
 **Run full workload matrix (when ready):**
@@ -91,24 +101,151 @@ Pre-fix July 24 runs (buffer bug, accidental `COMPACTION_THRESHOLD=2`) are liste
 
 ---
 
-## Workload A @ 10k (2026-07-24, post-fix)
+## Workload matrix @ 10k (Phase F, 2026-07-25)
 
-Single-thread, 256 MB MemTable, `COMPACTION_THRESHOLD=4`. All loads: `INSERT Return=OK, 10000`. All runs: 100% OK. Zero errors in log.
+Single-thread, 256 MB MemTable, `COMPACTION_THRESHOLD=4`, `BLOCK_CACHE_MB=0`, JVM `-Xms2G -Xmx2G`.
+All loads: `INSERT Return=OK, 10000`. All runs: 100% OK. Zero errors in log. No compaction triggered (1–2 L0 SSTables).
 
-| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) | Update p99 (µs) | Insert p99 (µs) | Disk | L0 |
-|----------|-------------|-------------|---------------|-----------------|-----------------|------|-----|
-| THRESHOLD | 2,563 | 4,554 | 89 | 685 | 682 | 35 MB | 2 |
-| SIZE_TIERED | 2,215 | 4,521 | 82 | 635 | 713 | 35 MB | 2 |
-| LEVEL_TIERED | 2,309 | **4,699** | 70 | 570 | 640 | 35 MB | 2 |
+Script: `./scripts/run-ycsb-workloads-bcf.sh 10000` (B/C/F) + `./scripts/run-ycsb-matrix.sh workloada-10k`.
 
-Results: `workloada-10k-*-20260724-040*.txt`
+### Workload A (50/50 read/update, zipfian)
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) | Update p99 (µs) |
+|----------|-------------|-------------|---------------|-----------------|
+| THRESHOLD | 9,833 | 17,241 | 73 | 191 |
+| SIZE_TIERED | 10,331 | **18,182** | 87 | 199 |
+| LEVEL_TIERED | 10,741 | 17,483 | 81 | 230 |
+
+Results: `workloada-10k-*-{load,run}-20260725-2236*.txt`, `2237*.txt`
+
+### Workload B (95/5 read/update, zipfian)
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) | Update p99 (µs) |
+|----------|-------------|-------------|---------------|-----------------|
+| THRESHOLD | 10,776 | **24,213** | 72 | 274 |
+| SIZE_TIERED | 9,681 | **24,272** | 67 | 303 |
+| LEVEL_TIERED | 8,097 | 16,949 | 68 | 303 |
+
+Results: `workloadb-10k-*-{load,run}-20260725-2230*.txt`, `2231*.txt`
+
+### Workload C (100% read, latest)
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) |
+|----------|-------------|-------------|---------------|
+| THRESHOLD | 10,341 | 33,223 | 71 |
+| SIZE_TIERED | 11,976 | **33,333** | 65 |
+| LEVEL_TIERED | 11,587 | 31,056 | 71 |
+
+Results: `workloadc-10k-*-{load,run}-20260725-2231*.txt`, `2232*.txt`
+
+### Workload F (50/50 read / RMW, zipfian)
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) | Update p99 (µs) | RMW p99 (µs) |
+|----------|-------------|-------------|---------------|-----------------|--------------|
+| THRESHOLD | 10,977 | 13,369 | 71 | 193 | 305 |
+| SIZE_TIERED | 12,255 | **15,848** | 74 | 201 | 303 |
+| LEVEL_TIERED | 10,277 | 11,848 | 72 | 180 | 282 |
+
+Results: `workloadf-10k-*-{load,run}-20260725-2232*.txt`
 
 Notes:
-- LTCS fastest run phase (~4.7k ops/s). 2 L0 SSTables each (load flush + run flush); compaction skipped (2 &lt; threshold 4).
+- Run throughput **~4×** vs pre–Phase F Workload A @ 10k (Jul 24: ~4.5k → now ~17–18k for 50/50 R/U).
+- Workload C fastest (~33k ops/s); Workload F slowest (~12–16k) due to read-modify-write cost.
+- THRESHOLD/STCS beat LTCS on B and F at 10k; strategy differences minimal on pure-read C.
+- Supersedes Jul 24 Workload A @ 10k numbers (`workloada-10k-*-20260724-040*.txt`, pre–Phase F).
 
 ---
 
-## Workload A @ 100k (2026-07-24, post Phase A/B/D)
+## Workload A @ 100k (Phase F, 2026-07-25)
+
+Single-thread, 256 MB MemTable, `COMPACTION_THRESHOLD=4`, `BLOCK_CACHE_MB=0`, JVM `-Xms2G -Xmx2G`.
+3 trials, 30 s warmup. Script: `RECORDCOUNT=100000 OPERATIONCOUNT=100000 TRIALS=3 ./scripts/run-ycsb-matrix.sh workloada 100000 100000`.
+
+All loads: `INSERT Return=OK, 100000`. All runs: 100% OK. Zero errors. No compaction triggered (2 L0 SSTables).
+
+50/50 read/update, zipfian. Tables show **median** run/load throughput across 3 trials. Latencies from trial 1.
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) | Update p99 (µs) |
+|----------|-------------|-------------|---------------|-----------------|
+| THRESHOLD | 22,805 | 27,902 | 28 | 77 |
+| SIZE_TIERED | 21,363 | **35,162** | 29 | 83 |
+| LEVEL_TIERED | 23,223 | 34,771 | 39 | 92 |
+
+Trial run throughputs: THRESHOLD `[39032, 27902, 26969]` · STCS `[35162, 33278, 35562]` · LTCS `[30713, 34771, 34916]`
+
+Results: `workloada-*-{load,run}-20260725-2320*.txt` … `2326*.txt`  
+Log: `/tmp/ycsb-a-100k.log`
+
+Notes:
+- Run throughput **~3–4×** vs Jul 24 post-opt A @ 100k (~8–10k → ~28–35k).
+- Among Phase F workloads @ 100k: slower than B/C (more writes) but comparable to F (~28–35k vs ~31k) — expected for 50/50 R/U vs 95/5 or 100% read.
+- STCS/LTCS ~25% ahead of THRESHOLD on run median; trial-1 cold effect on THRESHOLD (39k vs ~27k median).
+- Supersedes Jul 24 Workload A @ 100k sections below.
+
+---
+
+## Workload B/C/F @ 100k (Phase F, 2026-07-25)
+
+Single-thread, 256 MB MemTable, `COMPACTION_THRESHOLD=4`, `BLOCK_CACHE_MB=0`, JVM `-Xms2G -Xmx2G`.
+3 trials, 30 s warmup between cells. Script: `RECORDCOUNT=100000 OPERATIONCOUNT=100000 TRIALS=3 ./scripts/run-ycsb-workloads-bcf.sh 100000`.
+
+All loads: `INSERT Return=OK, 100000`. All runs: 100% OK. Zero errors. No compaction triggered (2 L0 SSTables: load flush + run flush).
+
+Tables show **median** run/load throughput across 3 trials. Latencies from trial 1. Trial-1 run throughputs listed for warmup comparison (trial 1 is cold; trials 2–3 benefit from matrix/OS cache warmth).
+
+### Workload B (95/5 read/update, zipfian)
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) | Update p99 (µs) |
+|----------|-------------|-------------|---------------|-----------------|
+| THRESHOLD | 22,983 | **64,392** | 33 | 290 |
+| SIZE_TIERED | 23,889 | 66,489 | 26 | 199 |
+| LEVEL_TIERED | 22,217 | 60,277 | 26 | 196 |
+
+Trial run throughputs: THRESHOLD `[36928, 67431, 64392]` · STCS `[62539, 67024, 66489]` · LTCS `[62035, 53677, 60277]`
+
+### Workload C (100% read, latest)
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) |
+|----------|-------------|-------------|---------------|
+| THRESHOLD | 23,245 | 92,081 | 21 |
+| SIZE_TIERED | 25,297 | 90,580 | 20 |
+| LEVEL_TIERED | 24,307 | **101,010** | 23 |
+
+Trial run throughputs: THRESHOLD `[101833, 92081, 88496]` · STCS `[104058, 90580, 90090]` · LTCS `[101010, 98232, 101215]`
+
+### Workload F (50/50 read / RMW, zipfian)
+
+| Strategy | Load (ops/s) | Run (ops/s) | Read p99 (µs) | Update p99 (µs) | RMW p99 (µs) |
+|----------|-------------|-------------|---------------|-----------------|--------------|
+| THRESHOLD | 24,950 | 31,837 | 46 | 78 | 113 |
+| SIZE_TIERED | 24,814 | 30,618 | 46 | 79 | 116 |
+| LEVEL_TIERED | 24,900 | **32,626** | 28 | 64 | 92 |
+
+Trial run throughputs: THRESHOLD `[28249, 32123, 31837]` · STCS `[29326, 30618, 35461]` · LTCS `[33535, 32626, 30722]`
+
+Results: `workload{b,c,f}-*-{load,run}-20260725-2257*.txt` … `2315*.txt`  
+Log: `/tmp/ycsb-bcf-100k-v2.log` (or terminal output from corrected re-run)
+
+Notes:
+- Workload C fastest (~90–101k run median); F slowest (~31k) due to read-modify-write.
+- STCS leads B run median (~66k); LTCS leads C and F at 100k (reverses 10k trend on B).
+- Trial-1 B throughputs ~40–45% below median — cite **medians** for cross-scale comparison; trial 1 for cold-start behavior.
+- Workload A @ 100k Phase F: ~28–35k run median (50/50 R/U) — between F (~31k) and B (~64k); see [Workload A @ 100k](#workload-a--100k-phase-f-2026-07-25).
+- Earlier mistaken 1k run (script bug) documented under [Runs to exclude](#runs-to-exclude).
+
+---
+
+## Workload B/C/F @ 1k (upstream, mistaken — 2026-07-25)
+
+**Do not use.** First `./scripts/run-ycsb-workloads-bcf.sh 100000` attempt used upstream 1k defaults due to a script bug (`run-ycsb-matrix.sh` cleared exported counts). Fixed and re-run @ 100k above.
+
+Results (archive only): `workload{b,c,f}-*-{load,run}-20260725-2237*.txt` … `2253*.txt`
+
+---
+
+## Workload A @ 100k (2026-07-24, post Phase A/B/D) — superseded
+
+**Superseded by [Workload A @ 100k (Phase F, 2026-07-25)](#workload-a--100k-phase-f-2026-07-25).** Historical reference only.
 
 Single-thread, 256 MB MemTable, `COMPACTION_THRESHOLD=4`, JVM `-Xms2G -Xmx2G`.
 Phases A (version snapshots), B1 (block cache), B2 (row cache), D (native `merge`) applied.
@@ -129,7 +266,9 @@ Notes:
 - 2 L0 per strategy; compaction not triggered (threshold 4).
 - No `NOT_FOUND`, `ERROR`, or exceptions in `/tmp/ycsb-100k-matrix-post-opt.log`.
 
-## Workload A @ 100k (2026-07-24, post-fix)
+## Workload A @ 100k (2026-07-24, post-fix) — superseded
+
+**Superseded by [Workload A @ 100k (Phase F, 2026-07-25)](#workload-a--100k-phase-f-2026-07-25).** Historical reference only.
 
 Single-thread, 256 MB MemTable, `COMPACTION_THRESHOLD=4`. All loads: `INSERT Return=OK, 100000`. All runs: 100% OK. Zero errors in log.
 
@@ -365,6 +504,7 @@ _TBD — fill after dedicated run._
 | `20260723-232830` – `233522` | 8 threads + compaction contention |
 | `20260724-001*` (10k/100k) | Pre-fix buffer bug; accidental `COMPACTION_THRESHOLD=2` |
 | `20260724-03*` (1M THRESHOLD) | Pre-fix: `newLimit > capacity` → compaction failed → ~10 L0, run ~3–7 ops/s; killed |
+| `20260725-2237*` – `2253*` (B/C/F) | Mistaken 1k run: script bug dropped `recordcount`/`operationcount` overrides |
 
 ---
 
@@ -374,6 +514,6 @@ _TBD — fill after dedicated run._
 - [x] Workload A @ 250k × 3 strategies (4 shards × 4 threads) — 2026-07-24 post-fix
 - [x] Workload A @ 1M × 3 strategies (cache off, WAL fix) — 2026-07-25 matrix v2
 - [x] Workload A @ 1M × 3 strategies (Phase F, 3 trials) — 2026-07-25
-- [ ] Workloads B, C, F @ 100k × 3 strategies
+- [x] Workloads B, C, F @ 100k × 3 strategies — 2026-07-25 (Phase F, 3 trials)
 - [ ] Compaction stress matrix results
 - [ ] CSV export / plotting script from `collect-ycsb-metrics.sh`
