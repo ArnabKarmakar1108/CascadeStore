@@ -116,3 +116,6 @@ buildNumber.properties
 
 # Local YCSB checkout (cloned by scripts/ycsb-env.sh)
 .ycsb/
+
+# Local benchmark / demo data directories
+data/

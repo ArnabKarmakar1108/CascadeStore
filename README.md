@@ -1,4 +1,4 @@
-# CascadeStore
+# <img src="lsm-icon.png" alt="CascadeStore" width="40" height="40" valign="middle"> CascadeStore
 
 [![Java Version](https://img.shields.io/badge/Java-17-orange.svg)](https://openjdk.java.net/projects/jdk/17/)
 
@@ -24,18 +24,21 @@ The engine follows the standard LSM lifecycle: mutations land in a mutable MemTa
 Main building blocks:
 
 - **MemTable** — concurrent skip-list index with off-heap value payloads
-- **WAL** — append-only recovery log with batched `fsync`
+- **WAL** — append-only recovery log with batched `fsync` and MANIFEST checkpointing
 - **SSTable** — sorted data files with sparse indexes and bloom filters
 - **Background services** — flush, compaction (three strategies), and TTL cleanup
+- **Metrics** — optional Prometheus scrape endpoint and browser dashboard
 
 ## Features
 
 - **Durable writes** — WAL group-commit (`fsync` every 1 MiB by default) with forced sync on MemTable rotation
+- **MANIFEST checkpointing** — incremental WAL replay after flush; purge checkpointed log segments
 - **Ordered storage** — keys stay sorted for range scans and merge iterators
 - **Compaction policies** — threshold, size-tiered, or level-tiered background merges
 - **TTL and tombstones** — per-key expiration and delete markers survive flush and compaction
 - **Read optimizations** — bloom filters (0.5% default FPR), sparse indexes (~16 KiB spacing), mmap-backed data reads, optional LRU block cache
 - **Concurrency** — `StorageVersion` snapshots pin SSTables for lock-free reads; parallel bloom probes when many tables are open
+- **Observability** — Prometheus metrics (`/metrics`) and a live browser dashboard (`/`) when enabled via `CascadeConfig`
 - **Off-heap memory** — direct `ByteBuffer` allocation with explicit cleanup via `Unsafe.invokeCleaner()`
 - **Configurable tuning** — MemTable size, compaction thresholds, block cache size, bloom parallelism via `CascadeConfig`
 
@@ -147,6 +150,65 @@ Storage tuned = new CascadeStore(config);
 
 ## Architecture
 
+```mermaid
+flowchart TB
+  subgraph client [Client]
+    PUT[put / delete / merge]
+    GET[get / scan]
+  end
+
+  subgraph engine [CascadeStore]
+    PS[PutStore / DeleteStore]
+    GS[GetStore]
+    MT[(Active MemTable)]
+    IMT[(Immutable MemTables)]
+    WAL[(WAL segments)]
+    MANIFEST[(MANIFEST)]
+  end
+
+  subgraph disk [On disk]
+    SST[(SSTables L0…Ln)]
+    IDX[.index + .filter]
+  end
+
+  subgraph bg [Background services]
+    FLUSH[FlushService]
+    COMP[CompactionService]
+    TTL[TTL Cleanup]
+  end
+
+  subgraph obs [Observability optional]
+    METRICS[Prometheus /metrics]
+    DASH[Browser dashboard /]
+  end
+
+  PUT --> PS
+  GET --> GS
+  PS --> WAL
+  PS --> MT
+  GS --> MT
+  GS --> IMT
+  GS --> SST
+  MT -->|full| IMT
+  IMT --> FLUSH
+  FLUSH --> SST
+  FLUSH --> MANIFEST
+  FLUSH -->|purge checkpointed| WAL
+  COMP --> SST
+  SST --> IDX
+  MANIFEST --> SST
+  engine -->|startup| MANIFEST
+  WAL -->|replay tail only| MT
+  engine -.-> METRICS
+  engine -.-> DASH
+```
+
+**Write path:** WAL append → MemTable → (on rotation) flush to SSTable → advance MANIFEST checkpoint → purge old WAL segments.
+
+**Read path:** active MemTable → immutable MemTables → SSTables (bloom filter → sparse index → data file).
+
+**Recovery:** load MANIFEST and SSTables, then replay only WAL records after `flushed_wal_sequence`.
+
 Package layout under `io.cascadestore.lsm`:
 
 | Package | Role |
@@ -154,7 +216,9 @@ Package layout under `io.cascadestore.lsm`:
 | **core** | `CascadeStore` facade; `PutStore` / `GetStore` / `DeleteStore`; flush, compaction, and TTL services |
 | **memtable** | Active and immutable in-memory tables with off-heap values |
 | **sstable** | On-disk sorted tables: data, sparse index, and bloom filter files |
-| **wal** | Append-only log, rotation, and crash recovery |
+| **wal** | Append-only log, rotation, checkpoint purge, and crash recovery |
+| **manifest** | MANIFEST checkpoint (live SSTables + WAL replay frontier) |
+| **metrics** | Prometheus collectors, HTTP dashboard, and demo workload |
 | **io** | Block cache, buffered/mmap data readers, buffer pools |
 | **config** | `CascadeConfig` and compaction strategy types |
 
@@ -186,6 +250,7 @@ Run a quick YCSB smoke test:
 | [memtable/README.md](src/main/java/io/cascadestore/lsm/memtable/README.md) | In-memory table layout |
 | [sstable/README.md](src/main/java/io/cascadestore/lsm/sstable/README.md) | On-disk format and lookup path |
 | [wal/README.md](src/main/java/io/cascadestore/lsm/wal/README.md) | WAL record format and file lifecycle |
+| [metrics/README.md](src/main/java/io/cascadestore/lsm/metrics/README.md) | Prometheus metrics and dashboard |
 | [benchmark README](src/test/java/io/cascadestore/lsm/benchmark/README.md) | JMH and YCSB harnesses |
 
 ## Contributing
