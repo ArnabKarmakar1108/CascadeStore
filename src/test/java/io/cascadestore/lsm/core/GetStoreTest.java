@@ -32,12 +32,18 @@ class GetStoreTest {
     readWriteLock = new ReentrantReadWriteLock();
 
     for (int i = 0; i < 2; i++) {
-      mockImmutableMemTables.add(Mockito.mock(MemTable.class));
+      MemTable memTable = Mockito.mock(MemTable.class);
+      Mockito.doNothing().when(memTable).pin();
+      Mockito.doNothing().when(memTable).unpin();
+      mockImmutableMemTables.add(memTable);
     }
 
     for (int i = 0; i < 2; i++) {
       mockSSTables.add(Mockito.mock(SSTable.class));
     }
+
+    Mockito.doNothing().when(mockActiveMemTable).pin();
+    Mockito.doNothing().when(mockActiveMemTable).unpin();
 
     storageVersion = new StorageVersion(1L, mockImmutableMemTables, mockSSTables);
     getStore = new GetStore(mockActiveMemTable, storageVersion, readWriteLock);
@@ -76,7 +82,8 @@ class GetStoreTest {
 
     verify(mockActiveMemTable, atLeastOnce()).get(key);
     for (MemTable memTable : mockImmutableMemTables) {
-      verifyNoInteractions(memTable);
+      verify(memTable, never()).get(key);
+      verify(memTable, never()).shadows(key);
     }
     for (SSTable ssTable : mockSSTables) {
       verify(ssTable, never()).get(key);
@@ -184,8 +191,13 @@ class GetStoreTest {
   @Test
   void testUpdateDependencies() {
     MemTable newMockMemTable = Mockito.mock(MemTable.class);
+    Mockito.doNothing().when(newMockMemTable).pin();
+    Mockito.doNothing().when(newMockMemTable).unpin();
     List<MemTable> newMockImmutableMemTables = new ArrayList<>();
-    newMockImmutableMemTables.add(Mockito.mock(MemTable.class));
+    MemTable newImmutable = Mockito.mock(MemTable.class);
+    Mockito.doNothing().when(newImmutable).pin();
+    Mockito.doNothing().when(newImmutable).unpin();
+    newMockImmutableMemTables.add(newImmutable);
     List<SSTable> newMockSSTables = new ArrayList<>();
     newMockSSTables.add(Mockito.mock(SSTable.class));
     ReadWriteLock newReadWriteLock = new ReentrantReadWriteLock();

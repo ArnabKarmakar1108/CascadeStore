@@ -14,13 +14,29 @@ public final class GetStore {
   private volatile MemTable activeMemTable;
   private volatile StorageVersion storageVersion;
   private ReadWriteLock memTableLock;
+  private final Object storageVersionGate;
   private final boolean parallelBloomEnabled;
   private final int parallelBloomMinTables;
   private final CascadeMetrics metrics;
 
   public GetStore(
       MemTable activeMemTable, StorageVersion storageVersion, ReadWriteLock memTableLock) {
-    this(activeMemTable, storageVersion, memTableLock, true, 3, CascadeMetrics.noop());
+    this(activeMemTable, storageVersion, memTableLock, new Object(), true, 3, CascadeMetrics.noop());
+  }
+
+  public GetStore(
+      MemTable activeMemTable,
+      StorageVersion storageVersion,
+      ReadWriteLock memTableLock,
+      Object storageVersionGate) {
+    this(
+        activeMemTable,
+        storageVersion,
+        memTableLock,
+        storageVersionGate,
+        true,
+        3,
+        CascadeMetrics.noop());
   }
 
   public GetStore(
@@ -33,6 +49,7 @@ public final class GetStore {
         activeMemTable,
         storageVersion,
         memTableLock,
+        new Object(),
         parallelBloomEnabled,
         parallelBloomMinTables,
         CascadeMetrics.noop());
@@ -42,6 +59,24 @@ public final class GetStore {
       MemTable activeMemTable,
       StorageVersion storageVersion,
       ReadWriteLock memTableLock,
+      Object storageVersionGate,
+      boolean parallelBloomEnabled,
+      int parallelBloomMinTables) {
+    this(
+        activeMemTable,
+        storageVersion,
+        memTableLock,
+        storageVersionGate,
+        parallelBloomEnabled,
+        parallelBloomMinTables,
+        CascadeMetrics.noop());
+  }
+
+  public GetStore(
+      MemTable activeMemTable,
+      StorageVersion storageVersion,
+      ReadWriteLock memTableLock,
+      Object storageVersionGate,
       boolean parallelBloomEnabled,
       int parallelBloomMinTables,
       CascadeMetrics metrics) {
@@ -54,9 +89,13 @@ public final class GetStore {
     if (memTableLock == null) {
       throw new IllegalArgumentException("memTableLock cannot be null");
     }
+    if (storageVersionGate == null) {
+      throw new IllegalArgumentException("storageVersionGate cannot be null");
+    }
     this.activeMemTable = activeMemTable;
     this.storageVersion = storageVersion;
     this.memTableLock = memTableLock;
+    this.storageVersionGate = storageVersionGate;
     this.parallelBloomEnabled = parallelBloomEnabled;
     this.parallelBloomMinTables = parallelBloomMinTables;
     this.metrics = metrics != null ? metrics : CascadeMetrics.noop();
@@ -95,27 +134,22 @@ public final class GetStore {
       return null;
     }
 
-    MemTable active;
-    StorageVersion version;
-    memTableLock.readLock().lock();
+    PinnedSnapshot snapshot = pinSnapshot();
     try {
-      active = activeMemTable;
-      version = storageVersion;
+      byte[] result = snapshot.active().get(key);
+      if (result != null) {
+        metrics.recordRead(0, 0, 0);
+        return result;
+      }
+      if (snapshot.active().shadows(key)) {
+        metrics.recordRead(0, 0, 0);
+        return null;
+      }
+
+      return lookupImmutableAndSSTables(key, snapshot.version(), true);
     } finally {
-      memTableLock.readLock().unlock();
+      snapshot.release();
     }
-
-    byte[] result = active.get(key);
-    if (result != null) {
-      metrics.recordRead(0, 0, 0);
-      return result;
-    }
-    if (active.shadows(key)) {
-      metrics.recordRead(0, 0, 0);
-      return null;
-    }
-
-    return lookupImmutableAndSSTables(key, version, true);
   }
 
   public int get(byte[] key) {
@@ -131,26 +165,36 @@ public final class GetStore {
       return RESULT_INVALID_INPUT;
     }
 
-    MemTable active;
-    StorageVersion version;
+    PinnedSnapshot snapshot = pinSnapshot();
+    try {
+      if (snapshot.active().containsKey(key)) {
+        return RESULT_SUCCESS;
+      }
+      if (snapshot.active().shadows(key)) {
+        return RESULT_KEY_NOT_FOUND;
+      }
+
+      return existsInImmutableAndSSTables(key, snapshot.version())
+          ? RESULT_SUCCESS
+          : RESULT_KEY_NOT_FOUND;
+    } finally {
+      snapshot.release();
+    }
+  }
+
+  private PinnedSnapshot pinSnapshot() {
     memTableLock.readLock().lock();
     try {
-      active = activeMemTable;
-      version = storageVersion;
+      synchronized (storageVersionGate) {
+        StorageVersion version = storageVersion;
+        version.retain();
+        MemTable active = activeMemTable;
+        active.pin();
+        return new PinnedSnapshot(active, version);
+      }
     } finally {
       memTableLock.readLock().unlock();
     }
-
-    if (active.containsKey(key)) {
-      return RESULT_SUCCESS;
-    }
-    if (active.shadows(key)) {
-      return RESULT_KEY_NOT_FOUND;
-    }
-
-    return existsInImmutableAndSSTables(key, version)
-        ? RESULT_SUCCESS
-        : RESULT_KEY_NOT_FOUND;
   }
 
   private boolean existsInImmutableAndSSTables(byte[] key, StorageVersion version) {
@@ -218,6 +262,29 @@ public final class GetStore {
       }
     }
     return new ReadStats(bloomCandidates, ssTables.size(), bloomNegatives, 0);
+  }
+
+  private static final class PinnedSnapshot {
+    private final MemTable active;
+    private final StorageVersion version;
+
+    private PinnedSnapshot(MemTable active, StorageVersion version) {
+      this.active = active;
+      this.version = version;
+    }
+
+    private MemTable active() {
+      return active;
+    }
+
+    private StorageVersion version() {
+      return version;
+    }
+
+    private void release() {
+      version.release();
+      active.unpin();
+    }
   }
 
   private static final class ReadStats {

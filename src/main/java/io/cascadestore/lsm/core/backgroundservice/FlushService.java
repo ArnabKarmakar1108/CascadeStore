@@ -184,7 +184,10 @@ public class FlushService extends AbstractBackgroundService {
       synchronized (immutableMemTables) {
         immutableMemTables.remove(memTable);
       }
-      memTable.close();
+      if (layoutPublisher != null) {
+        layoutPublisher.publishStorageLayout();
+      }
+      memTable.retire();
       logger.info("Skipping flush of empty MemTable");
       return;
     }
@@ -233,7 +236,7 @@ public class FlushService extends AbstractBackgroundService {
         onMemTableFlushed.accept(memTable);
       }
 
-      memTable.close();
+      memTable.retire();
       metrics.recordFlush(System.nanoTime() - flushStart, flushBytes);
       logger.info("Flushed MemTable to SSTable: {}", ssTable.getSequenceNumber());
     } catch (IOException e) {
@@ -259,13 +262,14 @@ public class FlushService extends AbstractBackgroundService {
   }
 
   private void maybeTriggerCompaction() {
+    boolean shouldCompact;
     synchronized (ssTables) {
-      boolean pending = ssTables.size() >= config.compactionThreshold();
-      metrics.setCompactionPending(pending);
-      if (pending) {
-        logger.info("Compaction threshold reached, triggering compaction");
-        compactionService.executeNow();
-      }
+      shouldCompact = ssTables.size() >= config.compactionThreshold();
+      metrics.setCompactionPending(shouldCompact);
+    }
+    if (shouldCompact) {
+      logger.info("Compaction threshold reached, triggering compaction");
+      compactionService.executeNow();
     }
   }
 }

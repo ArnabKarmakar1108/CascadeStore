@@ -35,10 +35,14 @@ public final class MappedDataFile implements AutoCloseable {
     return buffer.getInt((int) position);
   }
 
+  public long getLong(long position) {
+    return buffer.getLong((int) position);
+  }
+
   public void getBytes(long position, byte[] target, int offset, int length) {
-    int pos = (int) position;
-    buffer.position(pos);
-    buffer.get(target, offset, length);
+    // Absolute bulk get (JDK 13+) does not mutate the shared buffer's position,
+    // so concurrent reader threads can safely share this MappedByteBuffer.
+    buffer.get((int) position, target, offset, length);
   }
 
   public boolean bytesEqual(long position, int length, byte[] expected) {

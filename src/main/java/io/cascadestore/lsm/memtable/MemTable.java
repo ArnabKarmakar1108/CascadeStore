@@ -7,6 +7,7 @@ import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,6 +22,10 @@ public class MemTable {
   private final long maxSizeBytes;
   private volatile boolean immutable;
   private volatile boolean atCapacity;
+  private final AtomicInteger pinCount = new AtomicInteger(0);
+  private volatile boolean forceClosed;
+  private volatile boolean retired;
+  private boolean allocatorClosed;
 
   public static class ValueEntry {
     private static final int HEADER_SIZE = 16;
@@ -224,7 +229,57 @@ public class MemTable {
     return immutable;
   }
 
+  /** Retain this memtable for an in-flight read or storage-version snapshot. */
+  public void pin() {
+    if (forceClosed) {
+      throw new IllegalStateException("MemTable is closed");
+    }
+    pinCount.incrementAndGet();
+  }
+
+  /**
+   * Release a pin acquired via {@link #pin()}. Off-heap storage is freed here when this memtable has
+   * been retired (flushed) and the last pin drops, giving deterministic reclamation instead of
+   * relying on GC to run the buffer cleaners.
+   */
+  public void unpin() {
+    if (pinCount.decrementAndGet() == 0 && retired) {
+      closeAllocator();
+    }
+  }
+
+  /**
+   * Marks this memtable as flushed and no longer part of the live set. Its off-heap buffers are
+   * freed immediately if unpinned, otherwise by the final {@link #unpin()}.
+   */
+  public void retire() {
+    retired = true;
+    if (pinCount.get() == 0) {
+      closeAllocator();
+    }
+  }
+
+  /** Returns true once this memtable has been flushed and removed from the live immutable list. */
+  public boolean isRetired() {
+    return retired;
+  }
+
+  int getPinCountForTest() {
+    return pinCount.get();
+  }
+
+  /** Force-closes off-heap storage (shutdown / clear); callers must ensure no readers remain. */
   public void close() {
+    forceClosed = true;
+    retired = true;
+    closeAllocator();
+  }
+
+  private synchronized void closeAllocator() {
+    if (allocatorClosed) {
+      return;
+    }
+    allocatorClosed = true;
     allocator.close();
     logger.info("MemTable closed");
   }

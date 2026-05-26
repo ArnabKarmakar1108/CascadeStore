@@ -58,6 +58,7 @@ public class CascadeStore implements Storage {
 
   // Concurrency control
   private final ReadWriteLock memTableLock;
+  private final Object storageVersionGate = new Object();
   private final AtomicLong sequenceNumber;
   private final AtomicLong layoutVersionId;
   private volatile StorageVersion storageVersion;
@@ -204,6 +205,7 @@ public class CascadeStore implements Storage {
             activeMemTable,
             storageVersion,
             memTableLock,
+            storageVersionGate,
             config.parallelBloomEnabled(),
             config.parallelBloomMinTables(),
             metrics);
@@ -227,13 +229,16 @@ public class CascadeStore implements Storage {
     synchronized (ssTables) {
       ssTableCopy = new ArrayList<>(ssTables);
     }
-    StorageVersion previous = storageVersion;
-    storageVersion =
-        new StorageVersion(layoutVersionId.incrementAndGet(), immutableCopy, ssTableCopy);
-    if (previous != null) {
-      previous.release();
+    StorageVersion previous;
+    synchronized (storageVersionGate) {
+      previous = storageVersion;
+      storageVersion =
+          new StorageVersion(layoutVersionId.incrementAndGet(), immutableCopy, ssTableCopy);
+      getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
+      if (previous != null) {
+        previous.release();
+      }
     }
-    getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
     refreshStorageMetrics();
     try {
       persistManifest();
@@ -548,8 +553,20 @@ public class CascadeStore implements Storage {
 
   @Override
   public boolean merge(byte[] key, ValueMerger merger) {
+    return mergeWithRetry(key, merger, null);
+  }
+
+  @Override
+  public boolean merge(byte[] key, byte[] existingValue, ValueMerger merger) {
+    return mergeWithRetry(key, merger, existingValue);
+  }
+
+  private boolean mergeWithRetry(byte[] key, ValueMerger merger, byte[] existingValue) {
     for (int attempt = 0; attempt < 32; attempt++) {
-      int result = mergeStore.merge(key, merger);
+      int result =
+          existingValue == null
+              ? mergeStore.merge(key, merger)
+              : mergeStore.merge(key, existingValue, merger);
       if (result == MergeStore.RESULT_SUCCESS) {
         return true;
       }
@@ -824,6 +841,7 @@ public class CascadeStore implements Storage {
           activeMemTable.getEntries().size());
     }
 
+    boolean shouldFlush = false;
     memTableLock.writeLock().lock();
     try {
       activeMemTable.makeImmutable();
@@ -844,11 +862,22 @@ public class CascadeStore implements Storage {
       deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
       mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
 
+      try {
+        wal.sync();
+      } catch (IOException e) {
+        logger.warn("Failed to sync WAL during test MemTable switch", e);
+      }
+
       publishStorageLayout();
+      shouldFlush = true;
 
       logger.info("Switched to new MemTable for testing");
     } finally {
       memTableLock.writeLock().unlock();
+    }
+
+    if (shouldFlush) {
+      flushService.executeNow();
     }
   }
 
