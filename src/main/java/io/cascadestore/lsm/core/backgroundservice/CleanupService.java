@@ -37,71 +37,70 @@ public class CleanupService extends AbstractBackgroundService {
   @Override
   protected void doExecute() {
     try {
-      long now = System.currentTimeMillis();
-      List<byte[]> keysToRemove = new ArrayList<>();
+      List<byte[]> keysToRemove = collectExpiredKeys();
+      if (keysToRemove.isEmpty()) {
+        logger.debug("Expired entries cleanup completed (none found)");
+        return;
+      }
 
-      // Check active MemTable for expired entries
-      memTableLock.readLock().lock();
+      memTableLock.writeLock().lock();
       try {
-        Map<ByteArrayWrapper, MemTable.ValueEntry> entries = activeMemTable.getEntries();
-        for (Map.Entry<ByteArrayWrapper, MemTable.ValueEntry> entry : entries.entrySet()) {
-          if (entry.getValue().isExpired()) {
-            keysToRemove.add(entry.getKey().getData());
-          }
+        for (byte[] key : keysToRemove) {
+          activeMemTable.delete(key);
+          logger.debug("Added tombstone for expired entry with key: {}", Arrays.toString(key));
         }
       } finally {
-        memTableLock.readLock().unlock();
+        memTableLock.writeLock().unlock();
       }
 
-      // Remove expired entries from active MemTable
-      if (!keysToRemove.isEmpty()) {
-        memTableLock.writeLock().lock();
-        try {
-          for (byte[] key : keysToRemove) {
-            // Add a tombstone marker to indicate the key is deleted
-            activeMemTable.delete(key);
-            logger.debug("Removed expired entry with key: " + Arrays.toString(key));
-          }
-        } finally {
-          memTableLock.writeLock().unlock();
-        }
-      }
-
-      // Check immutable MemTables for expired entries
-      // We don't modify immutable MemTables, but we can add tombstone markers to the active
-      // MemTable
-      synchronized (immutableMemTables) {
-        for (MemTable memTable : immutableMemTables) {
-          keysToRemove.clear();
-          Map<ByteArrayWrapper, MemTable.ValueEntry> entries = memTable.getEntries();
-          for (Map.Entry<ByteArrayWrapper, MemTable.ValueEntry> entry : entries.entrySet()) {
-            if (entry.getValue().isExpired()) {
-              keysToRemove.add(entry.getKey().getData());
-            }
-          }
-
-          // Add tombstone markers for expired entries
-          if (!keysToRemove.isEmpty()) {
-            memTableLock.writeLock().lock();
-            try {
-              for (byte[] key : keysToRemove) {
-                // Add a tombstone marker to the active MemTable
-                activeMemTable.delete(key);
-                logger.debug("Added tombstone for expired entry with key: " + Arrays.toString(key));
-              }
-            } finally {
-              memTableLock.writeLock().unlock();
-            }
-          }
-        }
-      }
-
-      // We don't need to check SSTables for expired entries here
-      // Expired entries in SSTables will be filtered out during reads and removed during compaction
-
-      logger.debug("Expired entries cleanup completed");
+      logger.debug("Expired entries cleanup completed ({} tombstones)", keysToRemove.size());
     } catch (Exception e) {
       logger.warn("Error during expired entries cleanup", e);
+    }
+  }
+
+  private List<byte[]> collectExpiredKeys() {
+    List<byte[]> keysToRemove = new ArrayList<>();
+
+    memTableLock.readLock().lock();
+    try {
+      if (!activeMemTable.isRetired()) {
+        activeMemTable.pin();
+        try {
+          collectExpiredKeys(activeMemTable.getEntries(), keysToRemove);
+        } finally {
+          activeMemTable.unpin();
+        }
+      }
+    } finally {
+      memTableLock.readLock().unlock();
+    }
+
+    // Hold the immutable list monitor and pin each table so a concurrent flush cannot retire and
+    // free off-heap entry buffers while we scan for TTL expiry.
+    synchronized (immutableMemTables) {
+      for (MemTable memTable : immutableMemTables) {
+        if (memTable.isRetired()) {
+          continue;
+        }
+        memTable.pin();
+        try {
+          collectExpiredKeys(memTable.getEntries(), keysToRemove);
+        } finally {
+          memTable.unpin();
+        }
+      }
+    }
+
+    return keysToRemove;
+  }
+
+  private static void collectExpiredKeys(
+      Map<ByteArrayWrapper, MemTable.ValueEntry> entries, List<byte[]> keysToRemove) {
+    for (Map.Entry<ByteArrayWrapper, MemTable.ValueEntry> entry : entries.entrySet()) {
+      if (entry.getValue().isExpired()) {
+        keysToRemove.add(entry.getKey().getData());
+      }
     }
   }
 }
