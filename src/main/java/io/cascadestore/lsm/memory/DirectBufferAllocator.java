@@ -9,6 +9,13 @@ import java.util.List;
 
 public final class DirectBufferAllocator implements OffHeapAllocator {
 
+  /**
+   * Slab size for sub-allocation. Memtable entries are carved from these larger direct buffers so
+   * writes cost a pointer bump instead of a native {@code malloc} + {@code Cleaner} registration per
+   * entry. Values larger than a slab get a dedicated buffer.
+   */
+  static final int DEFAULT_SLAB_SIZE = 1 << 20; // 1 MiB
+
   private static final Object UNSAFE;
   private static final Method INVOKE_CLEANER;
 
@@ -28,17 +35,48 @@ public final class DirectBufferAllocator implements OffHeapAllocator {
     INVOKE_CLEANER = invokeCleaner;
   }
 
-  private final List<ByteBuffer> allocated = new ArrayList<>();
+  private final int slabSize;
+  // Every buffer we allocateDirect (slabs + oversized dedicated buffers). Only these carry a
+  // Cleaner and get freed on close(); the per-entry slices we hand out do not.
+  private final List<ByteBuffer> ownedBuffers = new ArrayList<>();
+  private ByteBuffer currentSlab;
   private boolean closed;
+
+  public DirectBufferAllocator() {
+    this(DEFAULT_SLAB_SIZE);
+  }
+
+  DirectBufferAllocator(int slabSize) {
+    if (slabSize <= 0) {
+      throw new IllegalArgumentException("slabSize must be positive");
+    }
+    this.slabSize = slabSize;
+  }
 
   @Override
   public synchronized ByteBuffer allocate(int bytes) {
     if (closed) {
       throw new IllegalStateException("Allocator is closed");
     }
-    ByteBuffer buffer = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder());
-    allocated.add(buffer);
-    return buffer;
+    if (bytes < 0) {
+      throw new IllegalArgumentException("bytes must be non-negative");
+    }
+
+    if (bytes > slabSize) {
+      ByteBuffer dedicated = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder());
+      ownedBuffers.add(dedicated);
+      return dedicated;
+    }
+
+    if (currentSlab == null || currentSlab.remaining() < bytes) {
+      currentSlab = ByteBuffer.allocateDirect(slabSize).order(ByteOrder.nativeOrder());
+      ownedBuffers.add(currentSlab);
+    }
+
+    int start = currentSlab.position();
+    currentSlab.position(start + bytes);
+    // Absolute slice (JDK 13+): independent position/limit, backed by the slab's memory.
+    return currentSlab.slice(start, bytes).order(ByteOrder.nativeOrder());
   }
 
   @Override
@@ -47,10 +85,11 @@ public final class DirectBufferAllocator implements OffHeapAllocator {
       return;
     }
     closed = true;
-    for (ByteBuffer buffer : allocated) {
+    currentSlab = null;
+    for (ByteBuffer buffer : ownedBuffers) {
       freeDirectBuffer(buffer);
     }
-    allocated.clear();
+    ownedBuffers.clear();
   }
 
   private static void freeDirectBuffer(ByteBuffer buffer) {
