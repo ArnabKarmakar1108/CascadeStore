@@ -127,4 +127,82 @@ class CompactionServiceTest {
     assertArrayEquals(largeValue, compactedTable.get("key1".getBytes()));
     assertArrayEquals(largeValue, compactedTable.get("key2".getBytes()));
   }
+
+  @Test
+  void mergeKeepsNewestValueOnKeyCollision() throws IOException {
+    MemTable older = new MemTable(config.memTableMaxSizeBytes());
+    older.put("shared".getBytes(), "old".getBytes(), 0);
+    older.put("only-old".getBytes(), "kept".getBytes(), 0);
+
+    MemTable newer = new MemTable(config.memTableMaxSizeBytes());
+    newer.put("shared".getBytes(), "new".getBytes(), 0);
+
+    // Lower sequence number is older; higher is newer and must win on collision.
+    ssTables.add(new SSTable(older, config.dataDirectory(), 0, sequenceNumber.getAndIncrement()));
+    ssTables.add(new SSTable(newer, config.dataDirectory(), 0, sequenceNumber.getAndIncrement()));
+
+    compactionService.executeNow();
+
+    assertEquals(1, ssTables.size());
+    SSTable compacted = ssTables.get(0);
+    assertArrayEquals("new".getBytes(), compacted.get("shared".getBytes()));
+    assertArrayEquals("kept".getBytes(), compacted.get("only-old".getBytes()));
+  }
+
+  @Test
+  void bottomLevelCompactionDropsTombstoneWithoutResurrectingValue() throws IOException {
+    MemTable withValue = new MemTable(config.memTableMaxSizeBytes());
+    withValue.put("gone".getBytes(), "value".getBytes(), 0);
+    withValue.put("survivor".getBytes(), "value".getBytes(), 0);
+
+    MemTable withDelete = new MemTable(config.memTableMaxSizeBytes());
+    withDelete.delete("gone".getBytes());
+
+    ssTables.add(
+        new SSTable(withValue, config.dataDirectory(), 0, sequenceNumber.getAndIncrement()));
+    ssTables.add(
+        new SSTable(withDelete, config.dataDirectory(), 0, sequenceNumber.getAndIncrement()));
+
+    // No deeper surviving table => output is the bottom level => tombstone (and the older value it
+    // shadows) can be discarded entirely. This is the case the old merge got wrong (resurrection).
+    compactionService.executeNow();
+
+    assertEquals(1, ssTables.size());
+    SSTable compacted = ssTables.get(0);
+    assertNull(compacted.get("gone".getBytes()), "deleted key must not be resurrected");
+    assertArrayEquals("value".getBytes(), compacted.get("survivor".getBytes()));
+    assertEquals(1, compacted.countEntries(), "only the surviving key should remain");
+  }
+
+  @Test
+  void nonBottomCompactionRetainsTombstoneToShadowDeeperData() throws IOException {
+    // A surviving table sits at a deeper level than the compaction output, so the tombstone must be
+    // preserved to keep shadowing any older value that could live below.
+    MemTable deep = new MemTable(config.memTableMaxSizeBytes());
+    deep.put("deep-key".getBytes(), "deep".getBytes(), 0);
+    ssTables.add(new SSTable(deep, config.dataDirectory(), 3, sequenceNumber.getAndIncrement()));
+
+    MemTable withValue = new MemTable(config.memTableMaxSizeBytes());
+    withValue.put("gone".getBytes(), "value".getBytes(), 0);
+
+    MemTable withDelete = new MemTable(config.memTableMaxSizeBytes());
+    withDelete.delete("gone".getBytes());
+
+    ssTables.add(
+        new SSTable(withValue, config.dataDirectory(), 0, sequenceNumber.getAndIncrement()));
+    ssTables.add(
+        new SSTable(withDelete, config.dataDirectory(), 0, sequenceNumber.getAndIncrement()));
+
+    compactionService.executeNow();
+
+    SSTable compacted = null;
+    for (SSTable ssTable : ssTables) {
+      if (ssTable.getLevel() == 1) {
+        compacted = ssTable;
+      }
+    }
+    assertNotNull(compacted, "expected a compacted table at level 1");
+    assertNull(compacted.get("gone".getBytes()), "tombstone reads as absent");
+    assertEquals(1, compacted.countEntries(), "tombstone must be retained above a deeper level");
+  }
 }

@@ -50,6 +50,7 @@ public class SSTable {
   private final int level;
   private final long sequenceNumber;
   private int entryCount;
+  private SSTableDataFormat dataFormat = SSTableDataFormat.legacy();
 
   private final AtomicInteger pinCount = new AtomicInteger(0);
   private volatile boolean retired;
@@ -90,6 +91,43 @@ public class SSTable {
     }
   }
 
+  /**
+   * Builds an SSTable by streaming pre-sorted records from {@code source} (used by compaction). The
+   * source is responsible for de-duplication (newest-wins) and any tombstone dropping.
+   */
+  public SSTable(
+      String directory,
+      int level,
+      long sequenceNumber,
+      BlockCache blockCache,
+      SortedRecordSource source,
+      int estimatedEntries)
+      throws IOException {
+    this.blockCache = blockCache;
+    this.creationTime = System.currentTimeMillis();
+    this.level = level;
+    this.sequenceNumber = sequenceNumber;
+    this.sparseIndex = SparseIndex.empty();
+
+    File dir = new File(directory);
+    if (!dir.exists()) {
+      dir.mkdirs();
+    }
+
+    String filePrefix = String.format("sst_L%d_S%d", level, sequenceNumber);
+    this.dataFilePath = Path.of(directory, filePrefix + ".data");
+    this.indexFilePath = Path.of(directory, filePrefix + ".index");
+    this.filterFilePath = Path.of(directory, filePrefix + ".filter");
+
+    try {
+      writeToDisk(source, estimatedEntries);
+      logger.info("Created merged SSTable: {} ({} entries)", filePrefix, entryCount);
+    } catch (IOException e) {
+      deleteFiles(directory, level, sequenceNumber);
+      throw e;
+    }
+  }
+
   public SSTable(String directory, int level, long sequenceNumber) throws IOException {
     this(directory, level, sequenceNumber, null);
   }
@@ -118,11 +156,23 @@ public class SSTable {
 
   private void flushToDisk(MemTable memTable) throws IOException {
     logger.info("Flushing MemTable to disk as SSTable");
+    if (!memTable.isImmutable()) {
+      memTable.makeImmutable();
+    }
+    try (SortedRecordSource source = new MemTableRecordSource(memTable)) {
+      writeToDisk(source, memTable.getEntries().size());
+    }
+    logger.info("MemTable flushed to SSTable successfully");
+  }
 
-    // Create a bloom filter for efficient negative lookups
-    BloomFilter filter = new BloomFilter(memTable.getEntries().size(), BloomFilter.DEFAULT_FALSE_POSITIVE_RATE);
+  /**
+   * Streams sorted records from {@code source} directly to the on-disk data/index/filter files.
+   * Shared by memtable flush and compaction merge so the record format stays identical.
+   */
+  private void writeToDisk(SortedRecordSource source, int estimatedEntries) throws IOException {
+    BloomFilter filter =
+        new BloomFilter(Math.max(estimatedEntries, 1), BloomFilter.DEFAULT_FALSE_POSITIVE_RATE);
 
-    // Create data and index files
     try (FileChannel writeDataChannel =
             FileChannel.open(
                 dataFilePath,
@@ -136,43 +186,19 @@ public class SSTable {
                 StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING)) {
 
-      // Write header to data file
-      int writtenEntries = 0;
-      ByteBuffer headerBuffer = ByteBuffer.allocate(16);
-      headerBuffer.putLong(creationTime);
-      headerBuffer.putInt(level);
-      headerBuffer.putInt(0);
-      headerBuffer.flip();
-      writeDataChannel.write(headerBuffer);
+      dataFormat = SSTableDataFormat.lz4();
+      dataFormat.writeHeader(writeDataChannel, creationTime, level);
 
-      // Write entries to data file and build sparse index
-      long currentOffset = 16; // Start after header
+      int writtenEntries = 0;
+      long currentOffset = dataFormat.dataStartOffset();
       long lastIndexedOffset = -1;
       ByteArrayWrapper lastIndexedKey = null;
       long lastEntryOffset = -1;
       TreeMap<ByteArrayWrapper, Long> indexBuilder = new TreeMap<>();
 
-      for (Map.Entry<ByteArrayWrapper, MemTable.ValueEntry> entry :
-          memTable.getEntries().entrySet()) {
-        byte[] key = entry.getKey().getData();
-        MemTable.ValueEntry valueEntry = entry.getValue();
-
-        if (valueEntry.isExpired()) {
-          continue;
-        }
-
-        final byte[] value;
-        if (valueEntry.isTombstone()) {
-          value = null;
-        } else {
-          value = valueEntry.getValue();
-          if (value == null) {
-            logger.warn(
-                "Skipping corrupt entry during flush: non-tombstone key has no value (key length {})",
-                key.length);
-            continue;
-          }
-        }
+      while (source.advance()) {
+        byte[] key = source.key();
+        byte[] value = source.value();
 
         filter.add(key);
 
@@ -182,27 +208,15 @@ public class SSTable {
         keyBuffer.flip();
         writeDataChannel.write(keyBuffer);
 
-        if (valueEntry.isTombstone()) {
-          ByteBuffer tombstoneBuffer = ByteBuffer.allocate(12);
-          tombstoneBuffer.putInt(0);
-          tombstoneBuffer.putLong(valueEntry.getExpirationTime());
-          tombstoneBuffer.flip();
-          writeDataChannel.write(tombstoneBuffer);
-        } else {
-          ByteBuffer valueBuffer = ByteBuffer.allocate(4 + value.length + 8);
-          valueBuffer.putInt(value.length);
-          valueBuffer.put(value);
-          valueBuffer.putLong(valueEntry.getExpirationTime());
-          valueBuffer.flip();
-          writeDataChannel.write(valueBuffer);
-        }
+        dataFormat.writeValueRecord(writeDataChannel, value, source.expirationTime());
 
-        lastIndexedKey = entry.getKey();
+        ByteArrayWrapper keyWrapper = new ByteArrayWrapper(key);
+        lastIndexedKey = keyWrapper;
         lastEntryOffset = currentOffset;
         writtenEntries++;
 
         if (SparseIndexPolicy.shouldAddIndexEntry(currentOffset, lastIndexedOffset)) {
-          indexBuilder.put(entry.getKey(), currentOffset);
+          indexBuilder.put(keyWrapper, currentOffset);
           lastIndexedOffset = currentOffset;
         }
 
@@ -215,15 +229,8 @@ public class SSTable {
 
       sparseIndex = SparseIndex.from(indexBuilder);
       entryCount = writtenEntries;
-      writeDataChannel.position(0);
-      headerBuffer.clear();
-      headerBuffer.putLong(creationTime);
-      headerBuffer.putInt(level);
-      headerBuffer.putInt(writtenEntries);
-      headerBuffer.flip();
-      writeDataChannel.write(headerBuffer, 0);
+      dataFormat.patchEntryCount(writeDataChannel, writtenEntries);
 
-      // Write index to index file
       for (int i = 0; i < sparseIndex.size(); i++) {
         byte[] key = sparseIndex.keyAt(i);
         long offset = sparseIndex.offsetAt(i);
@@ -238,20 +245,66 @@ public class SSTable {
       }
     }
 
-    // Save bloom filter to file
     filter.save(filterFilePath.toString());
-
-    // Load the bloom filter into memory
     this.bloomFilter = filter;
 
-    // Open the data file for reading
     this.dataChannel = FileChannel.open(dataFilePath, StandardOpenOption.READ);
     this.mappedDataFile = MappedDataFile.tryMap(dataChannel);
-
-    // Open the index file for reading
     this.indexChannel = FileChannel.open(indexFilePath, StandardOpenOption.READ);
+  }
 
-    logger.info("MemTable flushed to SSTable successfully");
+  /** Adapts an immutable memtable's entries to the streaming writer, skipping expired/corrupt rows. */
+  private static final class MemTableRecordSource implements SortedRecordSource {
+    private final java.util.Iterator<Map.Entry<ByteArrayWrapper, MemTable.ValueEntry>> iterator;
+    private byte[] key;
+    private byte[] value;
+    private long expirationTime;
+
+    private MemTableRecordSource(MemTable memTable) {
+      this.iterator = memTable.getEntries().entrySet().iterator();
+    }
+
+    @Override
+    public boolean advance() {
+      while (iterator.hasNext()) {
+        Map.Entry<ByteArrayWrapper, MemTable.ValueEntry> entry = iterator.next();
+        MemTable.ValueEntry valueEntry = entry.getValue();
+        if (valueEntry.isExpired()) {
+          continue;
+        }
+        if (valueEntry.isTombstone()) {
+          value = null;
+        } else {
+          byte[] v = valueEntry.getValue();
+          if (v == null) {
+            logger.warn(
+                "Skipping corrupt entry during flush: non-tombstone key has no value (key length {})",
+                entry.getKey().getData().length);
+            continue;
+          }
+          value = v;
+        }
+        key = entry.getKey().getData();
+        expirationTime = valueEntry.getExpirationTime();
+        return true;
+      }
+      return false;
+    }
+
+    @Override
+    public byte[] key() {
+      return key;
+    }
+
+    @Override
+    public byte[] value() {
+      return value;
+    }
+
+    @Override
+    public long expirationTime() {
+      return expirationTime;
+    }
   }
 
   private void loadFromDisk() throws IOException {
@@ -324,21 +377,14 @@ public class SSTable {
   }
 
   private int readDataFileHeader() throws IOException {
-    ByteBuffer headerBuffer = ByteBuffer.allocate(16);
-    dataChannel.read(headerBuffer, 0);
-    headerBuffer.flip();
-
-    long storedCreationTime = headerBuffer.getLong();
-    int storedLevel = headerBuffer.getInt();
-    int storedEntryCount = headerBuffer.getInt();
-
-    entryCount = storedEntryCount;
+    dataFormat = SSTableDataFormat.readHeader(dataChannel);
+    entryCount = dataFormat.readEntryCount(dataChannel);
     logger.info(
-        "Loaded SSTable with {} entries, level {}, creation time {}",
+        "Loaded SSTable with {} entries, level {}, compression={}",
         entryCount,
-        storedLevel,
-        storedCreationTime);
-    return storedEntryCount;
+        level,
+        dataFormat.lz4Values() ? "LZ4" : "none");
+    return entryCount;
   }
 
   private void rebuildBloomFilterFromData() {
@@ -348,7 +394,10 @@ public class SSTable {
   }
 
   public byte[] get(byte[] key) {
-    if (key == null || key.length == 0 || dataChannel == null || retired) {
+    // NOTE: a retired table may still be pinned by an in-flight reader's storage
+    // version; its files are not deleted until the pin count reaches zero, so it must
+    // keep serving reads. Only bail when the data channel is genuinely unavailable.
+    if (key == null || key.length == 0 || dataChannel == null) {
       return null;
     }
 
@@ -360,7 +409,7 @@ public class SSTable {
     try {
       long startOffset = sparseIndex.floorOffset(key);
       if (startOffset < 0) {
-        startOffset = 16;
+        startOffset = dataFormat.dataStartOffset();
       }
 
       BufferedDataReader reader = openDataReader();
@@ -374,7 +423,8 @@ public class SSTable {
 
   /** Returns true when the key maps to a live (non-tombstone) value in this SSTable. */
   public boolean containsKey(byte[] key) {
-    if (key == null || key.length == 0 || dataChannel == null || retired) {
+    // See get(): retired-but-pinned tables must keep serving reads.
+    if (key == null || key.length == 0 || dataChannel == null) {
       return false;
     }
 
@@ -385,7 +435,7 @@ public class SSTable {
     try {
       long startOffset = sparseIndex.floorOffset(key);
       if (startOffset < 0) {
-        startOffset = 16;
+        startOffset = dataFormat.dataStartOffset();
       }
 
       BufferedDataReader reader = openDataReader();
@@ -434,22 +484,10 @@ public class SSTable {
     while (reader.position() < reader.size()) {
       int keyLength = reader.readInt();
       if (reader.bytesEqual(keyLength, key)) {
-        int valueLength = reader.readInt();
-        if (valueLength == 0) {
-          reader.skip(8);
-          return null;
-        }
-        byte[] value = ValueBufferPool.readCopy(reader, valueLength);
-        reader.skip(8);
-        return value;
+        return dataFormat.readValue(reader);
       }
 
-      int valueLength = reader.readInt();
-      if (valueLength == 0) {
-        reader.skip(8);
-        continue;
-      }
-      reader.skip(valueLength + 8L);
+      dataFormat.skipValue(reader);
     }
     return null;
   }
@@ -460,21 +498,10 @@ public class SSTable {
     while (reader.position() < reader.size()) {
       int keyLength = reader.readInt();
       if (reader.bytesEqual(keyLength, key)) {
-        int valueLength = reader.readInt();
-        if (valueLength == 0) {
-          reader.skip(8);
-          return false;
-        }
-        reader.skip(valueLength + 8L);
-        return true;
+        return dataFormat.readValuePresence(reader);
       }
 
-      int valueLength = reader.readInt();
-      if (valueLength == 0) {
-        reader.skip(8);
-        continue;
-      }
-      reader.skip(valueLength + 8L);
+      dataFormat.skipValue(reader);
     }
     return false;
   }
@@ -498,21 +525,99 @@ public class SSTable {
     return reader;
   }
 
+  /**
+   * Streaming, sorted record source consumed by {@link #writeToDisk}. {@code value() == null}
+   * denotes a tombstone.
+   */
+  public interface SortedRecordSource extends AutoCloseable {
+    boolean advance() throws IOException;
+
+    byte[] key();
+
+    byte[] value();
+
+    long expirationTime();
+
+    @Override
+    default void close() throws IOException {}
+  }
+
+  /**
+   * Sequential cursor over this table's sorted data file, including tombstones and expiration
+   * timestamps. Intended for single-threaded compaction use; each cursor owns its own reader so it
+   * does not contend with concurrent point reads. The table must stay pinned for the cursor's life.
+   */
+  public RecordCursor openRecordCursor() throws IOException {
+    if (dataChannel == null) {
+      throw new IOException("SSTable data channel is not open: " + dataFilePath);
+    }
+    return new RecordCursor();
+  }
+
+  public final class RecordCursor implements AutoCloseable {
+    private final BufferedDataReader reader;
+    private byte[] key;
+    private byte[] value;
+    private long expirationTime;
+
+    private RecordCursor() throws IOException {
+      this.reader =
+          new BufferedDataReader(
+              dataChannel,
+              BufferedDataReader.DEFAULT_BUFFER_SIZE,
+              blockCache,
+              sequenceNumber,
+              mappedDataFile);
+      this.reader.seek(dataFormat.dataStartOffset());
+    }
+
+    public boolean advance() throws IOException {
+      if (reader.position() >= reader.size()) {
+        key = null;
+        value = null;
+        return false;
+      }
+      int keyLength = reader.readInt();
+      key = reader.readBytes(keyLength);
+      SSTableDataFormat.ValueRecord record = dataFormat.readRecord(reader);
+      value = record.value();
+      expirationTime = record.expirationTime();
+      return true;
+    }
+
+    public byte[] key() {
+      return key;
+    }
+
+    /** Decoded value, or {@code null} for a tombstone. */
+    public byte[] value() {
+      return value;
+    }
+
+    public long expirationTime() {
+      return expirationTime;
+    }
+
+    public long sourceSequence() {
+      return sequenceNumber;
+    }
+
+    @Override
+    public void close() {
+      reader.close();
+    }
+  }
+
   private void scanDataFile(DataFileEntryConsumer consumer) throws IOException {
     BufferedDataReader reader = openDataReader();
-    reader.seek(16);
+    reader.seek(dataFormat.dataStartOffset());
     while (reader.position() < reader.size()) {
       int keyLength = reader.readInt();
       byte[] key = reader.readBytes(keyLength);
-      int valueLength = reader.readInt();
-
-      if (valueLength == 0) {
-        reader.skip(8);
+      byte[] value = dataFormat.readValue(reader);
+      if (value == null) {
         continue;
       }
-
-      byte[] value = ValueBufferPool.readCopy(reader, valueLength);
-      reader.skip(8);
       consumer.accept(key, value);
     }
   }
@@ -523,7 +628,9 @@ public class SSTable {
   }
 
   public boolean mightContain(byte[] key) {
-    return !retired && bloomFilter != null && bloomFilter.mightContain(key);
+    // Retired-but-pinned tables must still be probed; skipping them would hide
+    // live keys from readers holding an older storage version.
+    return bloomFilter != null && bloomFilter.mightContain(key);
   }
 
   /** Retain this table for an in-flight read or compaction merge. */

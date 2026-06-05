@@ -132,6 +132,16 @@ public final class BufferedDataReader implements AutoCloseable {
     return buffer.getInt();
   }
 
+  public long readLong() throws IOException {
+    if (mapped != null) {
+      long value = mapped.getLong(mmapPosition);
+      mmapPosition += Long.BYTES;
+      return value;
+    }
+    ensureRemaining(Long.BYTES);
+    return buffer.getLong();
+  }
+
   public byte[] readBytes(int length) throws IOException {
     return ValueBufferPool.readCopy(this, length);
   }
