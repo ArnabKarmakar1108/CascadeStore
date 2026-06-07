@@ -111,6 +111,21 @@
             <version>${ycsb.version}</version>
             <scope>test</scope>
         </dependency>
+
+        <!-- RocksDB JNI for YCSB comparison harness -->
+        <dependency>
+            <groupId>org.rocksdb</groupId>
+            <artifactId>rocksdbjni</artifactId>
+            <version>8.11.3</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- LZ4 compression for SSTable values -->
+        <dependency>
+            <groupId>org.lz4</groupId>
+            <artifactId>lz4-java</artifactId>
+            <version>1.8.0</version>
+        </dependency>
     </dependencies>
 
     <build>
