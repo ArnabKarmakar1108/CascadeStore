@@ -109,6 +109,23 @@ public final class MergeStore {
       return RESULT_KEY_NOT_FOUND;
     }
 
+    return mergeExisting(key, existing, merger);
+  }
+
+  public int merge(byte[] key, byte[] existingValue, ValueMerger merger) {
+    lastException = null;
+
+    if (key == null || key.length == 0 || merger == null) {
+      return RESULT_INVALID_INPUT;
+    }
+    if (existingValue == null) {
+      return RESULT_KEY_NOT_FOUND;
+    }
+
+    return mergeExisting(key, existingValue, merger);
+  }
+
+  private int mergeExisting(byte[] key, byte[] existing, ValueMerger merger) {
     byte[] merged;
     try {
       merged = merger.merge(existing);

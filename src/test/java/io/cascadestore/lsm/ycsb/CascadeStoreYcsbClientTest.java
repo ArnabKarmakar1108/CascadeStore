@@ -45,6 +45,26 @@ class CascadeStoreYcsbClientTest {
   }
 
   @Test
+  void readThenUpdateUsesReadThroughCache() {
+    Map<String, ByteIterator> insertValues = new HashMap<>();
+    insertValues.put("field0", new ByteArrayByteIterator("alpha".getBytes()));
+    insertValues.put("field1", new ByteArrayByteIterator("beta".getBytes()));
+    assertEquals(Status.OK, client.insert("usertable", "user1", insertValues));
+
+    Map<String, ByteIterator> readResult = new HashMap<>();
+    assertEquals(Status.OK, client.read("usertable", "user1", null, readResult));
+
+    Map<String, ByteIterator> updateValues = new HashMap<>();
+    updateValues.put("field1", new ByteArrayByteIterator("gamma".getBytes()));
+    assertEquals(Status.OK, client.update("usertable", "user1", updateValues));
+
+    Map<String, ByteIterator> fullRecord = new HashMap<>();
+    assertEquals(Status.OK, client.read("usertable", "user1", null, fullRecord));
+    assertEquals("alpha", fullRecord.get("field0").toString());
+    assertEquals("gamma", fullRecord.get("field1").toString());
+  }
+
+  @Test
   void insertReadUpdateDeleteRoundTrip() {
     Map<String, ByteIterator> insertValues = new HashMap<>();
     insertValues.put("field0", new ByteArrayByteIterator("alpha".getBytes()));

@@ -43,6 +43,28 @@ class MergeOperationTest {
   }
 
   @Test
+  void mergeWithExistingValueSkipsLookup() {
+    CascadeStore store = newStore();
+    try {
+      byte[] key = "cached".getBytes(StandardCharsets.UTF_8);
+      byte[] original = "alpha".getBytes(StandardCharsets.UTF_8);
+      assertTrue(store.put(key, original));
+
+      assertTrue(
+          store.merge(
+              key,
+              original,
+              existing ->
+                  ("merged:" + new String(existing, StandardCharsets.UTF_8))
+                      .getBytes(StandardCharsets.UTF_8)));
+
+      assertArrayEquals("merged:alpha".getBytes(StandardCharsets.UTF_8), store.get(key));
+    } finally {
+      store.shutdown();
+    }
+  }
+
+  @Test
   void mergeReturnsFalseForMissingKey() {
     CascadeStore store = newStore();
     try {

@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -32,6 +33,9 @@ import site.ycsb.Status;
  * LSM tree.
  */
 public class CascadeStoreYcsbClient extends DB {
+
+  private static final ThreadLocal<ReadThroughCache> READ_THROUGH_CACHE =
+      ThreadLocal.withInitial(ReadThroughCache::new);
 
   private CascadeStore[] shards;
   private int shardCount;
@@ -146,8 +150,10 @@ public class CascadeStoreYcsbClient extends DB {
     byte[] storageKey = toStorageKey(table, key);
     byte[] record = shardFor(storageKey).get(storageKey);
     if (record == null) {
+      READ_THROUGH_CACHE.get().clear();
       return Status.NOT_FOUND;
     }
+    READ_THROUGH_CACHE.get().remember(storageKey, record);
     YcsbRecordCodec.decodeInto(record, fields, result);
     return Status.OK;
   }
@@ -200,9 +206,19 @@ public class CascadeStoreYcsbClient extends DB {
   @Override
   public Status update(String table, String key, Map<String, ByteIterator> values) {
     byte[] storageKey = toStorageKey(table, key);
-    boolean ok =
-        shardFor(storageKey)
-            .merge(storageKey, existing -> YcsbRecordCodec.merge(existing, values));
+    CascadeStore shard = shardFor(storageKey);
+    ReadThroughCache cache = READ_THROUGH_CACHE.get();
+    byte[] cachedRecord = cache.takeIfMatches(storageKey);
+    boolean ok;
+    if (cachedRecord != null) {
+      ok =
+          shard.merge(
+              storageKey,
+              cachedRecord,
+              existing -> YcsbRecordCodec.merge(existing, values));
+    } else {
+      ok = shard.merge(storageKey, existing -> YcsbRecordCodec.merge(existing, values));
+    }
     return ok ? Status.OK : Status.NOT_FOUND;
   }
 
@@ -306,6 +322,35 @@ public class CascadeStoreYcsbClient extends DB {
       Files.deleteIfExists(path);
     } catch (IOException ignored) {
       // Best effort cleanup for benchmark temp dirs.
+    }
+  }
+
+  /**
+   * Holds the raw value from the most recent {@link #read} on this thread so a following
+   * {@link #update} (YCSB read-modify-write) can merge without a second LSM lookup.
+   */
+  private static final class ReadThroughCache {
+    private byte[] key;
+    private byte[] value;
+
+    private void remember(byte[] storageKey, byte[] record) {
+      this.key = storageKey;
+      this.value = record;
+    }
+
+    private byte[] takeIfMatches(byte[] storageKey) {
+      if (key != null && value != null && Arrays.equals(key, storageKey)) {
+        byte[] cached = value;
+        clear();
+        return cached;
+      }
+      clear();
+      return null;
+    }
+
+    private void clear() {
+      key = null;
+      value = null;
     }
   }
 

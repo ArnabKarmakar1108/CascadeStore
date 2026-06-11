@@ -17,6 +17,13 @@ public interface Storage {
    */
   boolean merge(byte[] key, ValueMerger merger);
 
+  /**
+   * Applies {@code merger} to {@code existingValue} and persists the result without re-reading the
+   * key from storage. Callers must supply bytes that were read immediately before this call (e.g.
+   * YCSB read-modify-write).
+   */
+  boolean merge(byte[] key, byte[] existingValue, ValueMerger merger);
+
   byte[] get(byte[] key);
 
   boolean delete(byte[] key);
