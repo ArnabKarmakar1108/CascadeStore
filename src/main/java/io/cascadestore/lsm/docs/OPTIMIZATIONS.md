@@ -447,6 +447,113 @@ Report **trial 1** when comparing releases; later trials in a back-to-back matri
 
 ---
 
+## 19. Concurrency correctness — storage version pinning (2026-07-31)
+
+### Problem
+
+Under concurrent reads + flush + compaction (compaction-stress YCSB), three races produced `BufferUnderflowException`, torn values, and transient `NOT_FOUND`:
+
+1. **SSTable lifetime** — `publishStorageLayout()` released the previous `StorageVersion` while readers still held references to its SSTable list; input tables were closed/deleted mid-read.
+2. **MemTable lifetime** — `FlushService` called `memTable.close()` after flush, freeing off-heap buffers while pinned `StorageVersion` snapshots still referenced the immutable memtable.
+3. **Retired-but-pinned SSTables** — `SSTable.get()` / `mightContain()` returned early when `retired == true`, even though pin-counting guaranteed on-disk files were still valid for in-flight readers.
+
+A fourth bug caused **torn mmap reads**: `MappedDataFile.getBytes()` mutated the shared `MappedByteBuffer.position`, which is not thread-safe across concurrent reader threads.
+
+A fifth bug was a **publish race**: `getStore.updateDependencies()` ran outside `storageVersionGate`, so readers could pin a stale `(activeMemTable, storageVersion)` pair during layout publish.
+
+### Fix
+
+| Component | Change |
+| --- | --- |
+| `StorageVersion` | `retain()` / `release()` with ref-count; pins immutable memtables + SSTables at construction; unpins at ref-count 0 |
+| `GetStore.pinSnapshot()` | Retains version + pins active memtable for the lookup; releases in `finally` |
+| `CascadeStore.publishStorageLayout()` | Updates `GetStore` dependencies inside `storageVersionGate` before releasing previous version |
+| `FlushService` | No longer calls `memTable.close()`; calls `memTable.retire()` after successful flush |
+| `MemTable` | `pin()` / `unpin()` / `retire()` — off-heap freed when retired and last pin drops |
+| `SSTable.get()` / `containsKey()` / `mightContain()` | Serve reads on retired-but-pinned tables (files deleted only when pin count hits 0) |
+| `MappedDataFile.getBytes()` | Absolute bulk `buffer.get(position, …)` — no shared position mutation |
+
+`StorageVersionRetainTest` exercises 8 reader threads × 20 memtable rotations under load.
+
+### Impact
+
+Eliminates compaction-stress `BufferUnderflowException` and the “one failure per workload” pattern. Required for fair RocksDB comparison runs at 250k with frequent compaction.
+
+---
+
+## 20. Streaming k-way compaction merge (2026-07-31)
+
+### Problem
+
+Compaction materialized **all** input SSTable entries into a `HashMap`, then a merge `MemTable`, then flushed to a new SSTable — **2–3× input size** on-heap per compaction (~500–750 MB for 250 MB inputs). A per-compaction `Executors.newCachedThreadPool()` was created and torn down on every run.
+
+The merge also dropped tombstones (`value == null`) at **every** level. Dropping a tombstone mid-tree can resurrect a deleted key still living in a deeper SSTable.
+
+### Fix
+
+**Streaming k-way merge** (`CompactionService.KWayMergeSource`):
+
+1. Open a sorted `SSTable.RecordCursor` per input table.
+2. Min-heap merge by key (newest sequence wins on ties).
+3. Stream merged records directly into `SSTable.writeToDisk()` via `SortedRecordSource` — **O(#tables)** memory, no intermediate `HashMap` or merge memtable.
+
+**Bottom-level tombstone rule** — tombstones are dropped only when `outputLevel > maxSurvivingLevel` (no deeper table can hold an older value for the same key). Otherwise tombstones are retained in the output SSTable.
+
+Shared write path: memtable flush and compaction merge both use `SSTable.writeToDisk(SortedRecordSource)`.
+
+### Impact
+
+Lower compaction heap/GC pressure under compaction-stress config (64 MB memtable, threshold 2). Correct delete semantics when deeper levels exist.
+
+---
+
+## 21. LZ4 per-value SSTable compression (2026-07-31)
+
+### Problem
+
+Uncompressed SSTables at 250k scale use ~360 MB per workload datadir. RocksDB defaults to Snappy; comparison fairness benefits from optional compression on the CascadeStore side.
+
+### Fix
+
+**SSTable data format v2** (`SSTableDataFormat`, magic `CASK`):
+
+- Per-record LZ4 when value ≥ 64 bytes and compressed size saves ≥ 5%; otherwise **RAW** flag.
+- Legacy v1 files (no magic header) remain readable.
+- New flushes and compaction outputs use v2.
+
+Dependency: `org.lz4:lz4-java`.
+
+### Measured on YCSB-shaped data
+
+| Mode | Savings |
+| --- | --- |
+| Per-value LZ4 | **0%** (random field values are incompressible) |
+| Per-64 KiB block (not implemented) | ~4.7% |
+
+On YCSB, LZ4 adds negligible CPU overhead (RAW fallback) and keeps disk footprint comparable to RocksDB/Snappy. Block-level compression deferred — marginal YCSB gain, high read-path rewrite risk.
+
+---
+
+## 22. DirectBufferAllocator slab / arena (2026-07-31)
+
+### Problem
+
+Each memtable entry called `ByteBuffer.allocateDirect()` — one native `malloc` + `Cleaner` registration per put. A 64 MB memtable with ~1 KB records triggered **~65,000** native allocations per rotation.
+
+### Fix
+
+**Slab allocator** (`DirectBufferAllocator`):
+
+- Carve entries from **1 MiB** direct slabs via absolute `slice(start, length)` (JDK 13+).
+- Values larger than a slab get a dedicated buffer.
+- Only slab roots are tracked and freed on `close()`; per-entry slices share slab memory.
+
+### Impact
+
+~1000× fewer native allocations per memtable on the write path. Pairs with §19 memtable `retire()` for prompt off-heap reclaim when the last reader unpins a flushed table.
+
+---
+
 ## 18. Optimization summary table
 
 | Optimization | Primary win | Correctness or perf |
@@ -466,3 +573,11 @@ Report **trial 1** when comparing releases; later trials in a back-to-back matri
 | **Block cache (optional)** | **Hot SSTable region reuse** | **Perf** |
 | **Phase F: mmap + sparse index + scan skip** | **1M run 3–5× vs v2 matrix (trial 1)** | **Perf** |
 | **Phase F: version pin + YCSB patch + parallel bloom** | **Lower per-op overhead on hot path** | **Perf** |
+| **Storage version + memtable pinning** | **No torn reads / flush-window NOT_FOUND** | **Correctness** |
+| **Retired-but-pinned SSTable reads** | **No transient NOT_FOUND during compaction** | **Correctness** |
+| **mmap absolute bulk get** | **Thread-safe concurrent mmap reads** | **Correctness** |
+| **Streaming k-way compaction** | **Lower compaction heap; O(tables) merge** | **Perf** |
+| **Bottom-level tombstone drop** | **Correct deletes across levels** | **Correctness** |
+| **LZ4 per-value SSTable (v2)** | **Fair vs RocksDB Snappy; RAW on YCSB** | **Perf / fairness** |
+| **DirectBufferAllocator slabs** | **~1000× fewer native allocs per memtable** | **Perf** |
+| **MemTable retire + pin reclaim** | **Deterministic off-heap free after flush** | **Perf / correctness** |
