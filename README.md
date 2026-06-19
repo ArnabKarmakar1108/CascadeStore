@@ -1,4 +1,4 @@
-# <img src="lsm-icon.png" alt="CascadeStore" width="40" height="40" valign="middle"> CascadeStore
+# <img src="lsm-icon.png" alt="CascadeStore" width="50" height="50" valign="middle"> CascadeStore
 
 [![Java Version](https://img.shields.io/badge/Java-17-orange.svg)](https://openjdk.java.net/projects/jdk/17/)
 
