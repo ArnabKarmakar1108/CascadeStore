@@ -322,6 +322,22 @@ public final class CascadeMetrics {
     walFsyncDurationSeconds.observe(nanosToSeconds(durationNanos));
   }
 
+  public AmplificationSnapshot snapshot(long liveSstableDataBytes, long liveSstableCount) {
+    if (!enabled) {
+      return AmplificationSnapshot.EMPTY;
+    }
+    return new AmplificationSnapshot(
+        (long) readOperationsTotal.get(),
+        (long) sstableLookupsTotal.get(),
+        (long) bloomProbesTotal.get(),
+        (long) bloomNegativeTotal.get(),
+        (long) userWriteBytesTotal.get(),
+        (long) sstableBytesWrittenTotal.get(),
+        (long) compactionTotal.get(),
+        liveSstableDataBytes,
+        liveSstableCount);
+  }
+
   private static double nanosToSeconds(long nanos) {
     return nanos / (double) TimeUnit.SECONDS.toNanos(1);
   }

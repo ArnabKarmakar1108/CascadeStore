@@ -16,7 +16,8 @@ public record CascadeConfig(
     boolean parallelBloomEnabled,
     int parallelBloomMinTables,
     boolean metricsEnabled,
-    int metricsPort) {
+    int metricsPort,
+    boolean sstableLz4Enabled) {
 
   public CascadeConfig(
       int memTableMaxSizeBytes,
@@ -38,7 +39,8 @@ public record CascadeConfig(
         true,
         3,
         false,
-        9090);
+        9090,
+        true);
   }
 
   public CascadeConfig(
@@ -62,7 +64,8 @@ public record CascadeConfig(
         true,
         3,
         false,
-        9090);
+        9090,
+        true);
   }
 
   public CascadeConfig(
@@ -88,7 +91,8 @@ public record CascadeConfig(
         parallelBloomEnabled,
         parallelBloomMinTables,
         false,
-        9090);
+        9090,
+        true);
   }
 
   public CascadeConfig {
@@ -119,8 +123,8 @@ public record CascadeConfig(
     if (parallelBloomMinTables <= 0) {
       throw new IllegalArgumentException("parallelBloomMinTables must be positive");
     }
-    if (metricsPort <= 0 || metricsPort > 65535) {
-      throw new IllegalArgumentException("metricsPort must be between 1 and 65535");
+    if (metricsPort < 0 || metricsPort > 65535) {
+      throw new IllegalArgumentException("metricsPort must be between 0 and 65535 (0 = ephemeral)");
     }
   }
 
@@ -164,7 +168,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withDataDirectory(String dataDirectory) {
@@ -180,7 +185,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withCompactionThreshold(int compactionThreshold) {
@@ -196,7 +202,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withCompactionIntervalMinutes(double compactionIntervalMinutes) {
@@ -212,7 +219,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withCleanupIntervalMinutes(int cleanupIntervalMinutes) {
@@ -228,7 +236,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withFlushIntervalSeconds(int flushIntervalSeconds) {
@@ -244,7 +253,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withCompactionStrategyType(CompactionStrategyType compactionStrategyType) {
@@ -260,7 +270,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withBlockCacheSizeBytes(int blockCacheSizeBytes) {
@@ -276,7 +287,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withParallelBloomEnabled(boolean parallelBloomEnabled) {
@@ -292,7 +304,8 @@ public record CascadeConfig(
         parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withParallelBloomMinTables(int parallelBloomMinTables) {
@@ -308,7 +321,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         parallelBloomMinTables,
         this.metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withMetricsEnabled(boolean metricsEnabled) {
@@ -324,7 +338,8 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         metricsEnabled,
-        this.metricsPort);
+        this.metricsPort,
+        this.sstableLz4Enabled);
   }
 
   public CascadeConfig withMetricsPort(int metricsPort) {
@@ -340,6 +355,24 @@ public record CascadeConfig(
         this.parallelBloomEnabled,
         this.parallelBloomMinTables,
         this.metricsEnabled,
-        metricsPort);
+        metricsPort,
+        this.sstableLz4Enabled);
+  }
+
+  public CascadeConfig withSstableLz4Enabled(boolean sstableLz4Enabled) {
+    return new CascadeConfig(
+        this.memTableMaxSizeBytes,
+        this.dataDirectory,
+        this.compactionThreshold,
+        this.compactionIntervalMinutes,
+        this.cleanupIntervalMinutes,
+        this.flushIntervalSeconds,
+        this.compactionStrategyType,
+        this.blockCacheSizeBytes,
+        this.parallelBloomEnabled,
+        this.parallelBloomMinTables,
+        this.metricsEnabled,
+        this.metricsPort,
+        sstableLz4Enabled);
   }
 }
