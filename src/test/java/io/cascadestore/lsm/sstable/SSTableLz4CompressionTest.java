@@ -19,6 +19,31 @@ class SSTableLz4CompressionTest {
   @TempDir Path tempDir;
 
   @Test
+  void flushedSSTableCanDisableLz4AndUseLegacyFormat() throws Exception {
+    MemTable memTable = new MemTable(1024 * 1024);
+    byte[] key = "legacy-key".getBytes(StandardCharsets.UTF_8);
+    byte[] value = "legacy-value".getBytes(StandardCharsets.UTF_8);
+    assertTrue(memTable.put(key, value, 0));
+    memTable.makeImmutable();
+
+    SSTable table = new SSTable(memTable, tempDir.toString(), 0, 43, null, false);
+    try {
+      assertArrayEquals(value, table.get(key));
+      byte[] header = Files.readAllBytes(tempDir.resolve("sst_L0_S43.data"));
+      assertEqualsInt(SSTableDataFormat.LEGACY_HEADER_SIZE, header.length > 16 ? 16 : header.length);
+      int firstInt =
+          ((header[0] & 0xFF) << 24)
+              | ((header[1] & 0xFF) << 16)
+              | ((header[2] & 0xFF) << 8)
+              | (header[3] & 0xFF);
+      assertTrue(firstInt != SSTableDataFormat.MAGIC, "legacy SSTable must not use LZ4 magic header");
+    } finally {
+      table.close();
+      table.delete();
+    }
+  }
+
+  @Test
   void flushedSSTableUsesLz4HeaderAndRoundTripsValues() throws Exception {
     MemTable memTable = new MemTable(1024 * 1024);
     byte[] key = "compression-key".getBytes(StandardCharsets.UTF_8);

@@ -55,16 +55,29 @@ public class SSTable {
   private final AtomicInteger pinCount = new AtomicInteger(0);
   private volatile boolean retired;
   private final BlockCache blockCache;
+  private final boolean writeLz4Enabled;
 
   public SSTable(MemTable memTable, String directory, int level, long sequenceNumber)
       throws IOException {
-    this(memTable, directory, level, sequenceNumber, null);
+    this(memTable, directory, level, sequenceNumber, null, true);
   }
 
   public SSTable(
       MemTable memTable, String directory, int level, long sequenceNumber, BlockCache blockCache)
       throws IOException {
+    this(memTable, directory, level, sequenceNumber, blockCache, true);
+  }
+
+  public SSTable(
+      MemTable memTable,
+      String directory,
+      int level,
+      long sequenceNumber,
+      BlockCache blockCache,
+      boolean writeLz4Enabled)
+      throws IOException {
     this.blockCache = blockCache;
+    this.writeLz4Enabled = writeLz4Enabled;
     this.creationTime = System.currentTimeMillis();
     this.level = level;
     this.sequenceNumber = sequenceNumber;
@@ -103,7 +116,20 @@ public class SSTable {
       SortedRecordSource source,
       int estimatedEntries)
       throws IOException {
+    this(directory, level, sequenceNumber, blockCache, source, estimatedEntries, true);
+  }
+
+  public SSTable(
+      String directory,
+      int level,
+      long sequenceNumber,
+      BlockCache blockCache,
+      SortedRecordSource source,
+      int estimatedEntries,
+      boolean writeLz4Enabled)
+      throws IOException {
     this.blockCache = blockCache;
+    this.writeLz4Enabled = writeLz4Enabled;
     this.creationTime = System.currentTimeMillis();
     this.level = level;
     this.sequenceNumber = sequenceNumber;
@@ -135,6 +161,7 @@ public class SSTable {
   public SSTable(String directory, int level, long sequenceNumber, BlockCache blockCache)
       throws IOException {
     this.blockCache = blockCache;
+    this.writeLz4Enabled = true;
     this.level = level;
     this.sequenceNumber = sequenceNumber;
     this.sparseIndex = SparseIndex.empty();
@@ -186,7 +213,7 @@ public class SSTable {
                 StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING)) {
 
-      dataFormat = SSTableDataFormat.lz4();
+      dataFormat = writeLz4Enabled ? SSTableDataFormat.lz4() : SSTableDataFormat.legacy();
       dataFormat.writeHeader(writeDataChannel, creationTime, level);
 
       int writtenEntries = 0;
@@ -706,21 +733,37 @@ public class SSTable {
   }
 
   public long getSizeBytes() {
-    long size = 0;
+    return getDataFileSizeBytes() + getIndexFileSizeBytes() + getFilterFileSizeBytes();
+  }
 
+  public long getDataFileSizeBytes() {
     try {
       File dataFile = dataFilePath.toFile();
-      File indexFile = indexFilePath.toFile();
-      File filterFile = filterFilePath.toFile();
-
-      if (dataFile.exists()) size += dataFile.length();
-      if (indexFile.exists()) size += indexFile.length();
-      if (filterFile.exists()) size += filterFile.length();
+      return dataFile.exists() ? dataFile.length() : 0L;
     } catch (Exception e) {
-      logger.warn("Error getting SSTable size", e);
+      logger.warn("Error getting SSTable data file size", e);
+      return 0L;
     }
+  }
 
-    return size;
+  private long getIndexFileSizeBytes() {
+    try {
+      File indexFile = indexFilePath.toFile();
+      return indexFile.exists() ? indexFile.length() : 0L;
+    } catch (Exception e) {
+      logger.warn("Error getting SSTable index file size", e);
+      return 0L;
+    }
+  }
+
+  private long getFilterFileSizeBytes() {
+    try {
+      File filterFile = filterFilePath.toFile();
+      return filterFile.exists() ? filterFile.length() : 0L;
+    } catch (Exception e) {
+      logger.warn("Error getting SSTable filter file size", e);
+      return 0L;
+    }
   }
 
   public void close() {

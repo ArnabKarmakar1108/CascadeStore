@@ -2,6 +2,7 @@ package io.cascadestore.lsm.core.store;
 
 import io.cascadestore.lsm.api.ValueMerger;
 import io.cascadestore.lsm.memtable.MemTable;
+import io.cascadestore.lsm.metrics.CascadeMetrics;
 import io.cascadestore.lsm.wal.WAL;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,6 +24,7 @@ public final class MergeStore {
   private WAL wal;
   private AtomicBoolean recovering;
   private GetStore getStore;
+  private CascadeMetrics metrics;
 
   private IOException lastException;
 
@@ -32,6 +34,16 @@ public final class MergeStore {
       WAL wal,
       AtomicBoolean recovering,
       GetStore getStore) {
+    this(activeMemTable, memTableLock, wal, recovering, getStore, CascadeMetrics.noop());
+  }
+
+  public MergeStore(
+      MemTable activeMemTable,
+      ReadWriteLock memTableLock,
+      WAL wal,
+      AtomicBoolean recovering,
+      GetStore getStore,
+      CascadeMetrics metrics) {
     if (activeMemTable == null) {
       throw new IllegalArgumentException("activeMemTable cannot be null");
     }
@@ -53,6 +65,7 @@ public final class MergeStore {
     this.wal = wal;
     this.recovering = recovering;
     this.getStore = getStore;
+    this.metrics = metrics != null ? metrics : CascadeMetrics.noop();
   }
 
   public void updateDependencies(
@@ -61,6 +74,16 @@ public final class MergeStore {
       WAL wal,
       AtomicBoolean recovering,
       GetStore getStore) {
+    updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore, metrics);
+  }
+
+  public void updateDependencies(
+      MemTable activeMemTable,
+      ReadWriteLock memTableLock,
+      WAL wal,
+      AtomicBoolean recovering,
+      GetStore getStore,
+      CascadeMetrics metrics) {
     if (activeMemTable == null) {
       throw new IllegalArgumentException("activeMemTable cannot be null");
     }
@@ -82,6 +105,7 @@ public final class MergeStore {
     this.wal = wal;
     this.recovering = recovering;
     this.getStore = getStore;
+    this.metrics = metrics != null ? metrics : CascadeMetrics.noop();
   }
 
   public IOException getLastException() {
@@ -143,7 +167,11 @@ public final class MergeStore {
         long walSequence = wal.appendPutRecord(key, merged, 0);
         noteWalSequence(walSequence);
       }
-      return putInMemTable(key, merged, 0);
+      int result = putInMemTable(key, merged, 0);
+      if (result == RESULT_SUCCESS) {
+        metrics.recordUserWriteBytes(key.length + merged.length);
+      }
+      return result;
     } catch (IOException e) {
       logger.error("Error writing merged value to WAL", e);
       lastException = e;

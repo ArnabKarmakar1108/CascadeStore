@@ -168,7 +168,8 @@ public class CompactionService extends AbstractBackgroundService {
                   newSequenceNumber,
                   blockCache,
                   mergeSource,
-                  Math.max(estimatedEntries, 1));
+                  Math.max(estimatedEntries, 1),
+                  config.sstableLz4Enabled());
         }
 
         SSTable committedTable = compactedTable.countEntries() > 0 ? compactedTable : null;

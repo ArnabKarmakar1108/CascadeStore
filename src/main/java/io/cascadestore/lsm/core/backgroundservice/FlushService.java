@@ -218,7 +218,8 @@ public class FlushService extends AbstractBackgroundService {
 
     try {
       SSTable ssTable =
-          new SSTable(memTable, config.dataDirectory(), 0, seqNum, blockCache);
+          new SSTable(
+              memTable, config.dataDirectory(), 0, seqNum, blockCache, config.sstableLz4Enabled());
 
       synchronized (immutableMemTables) {
         synchronized (ssTables) {

@@ -67,6 +67,16 @@ final class SSTableDataFormat {
   }
 
   void writeHeader(FileChannel channel, long creationTime, int level) throws IOException {
+    if (!lz4Values) {
+      ByteBuffer header = ByteBuffer.allocate(LEGACY_HEADER_SIZE).order(ByteOrder.BIG_ENDIAN);
+      header.putLong(creationTime);
+      header.putInt(level);
+      header.putInt(0); // entry count patched after flush
+      header.flip();
+      channel.write(header);
+      return;
+    }
+
     ByteBuffer header = ByteBuffer.allocate(LZ4_HEADER_SIZE).order(ByteOrder.BIG_ENDIAN);
     header.putInt(MAGIC);
     header.putInt(VERSION_LZ4);
@@ -106,6 +116,15 @@ final class SSTableDataFormat {
     }
 
     byte[] compressed = lz4Values ? Lz4Compression.compressIfBeneficial(value) : null;
+    if (!lz4Values) {
+      ByteBuffer raw = ByteBuffer.allocate(4 + value.length + 8).order(ByteOrder.BIG_ENDIAN);
+      raw.putInt(value.length);
+      raw.put(value);
+      raw.putLong(expirationTime);
+      raw.flip();
+      channel.write(raw);
+      return;
+    }
     if (compressed == null) {
       ByteBuffer raw =
           ByteBuffer.allocate(1 + 4 + value.length + 8).order(ByteOrder.BIG_ENDIAN);

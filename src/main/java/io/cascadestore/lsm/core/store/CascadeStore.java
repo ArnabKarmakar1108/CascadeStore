@@ -13,6 +13,7 @@ import io.cascadestore.lsm.io.BlockCache;
 import io.cascadestore.lsm.manifest.Manifest;
 import io.cascadestore.lsm.manifest.ManifestStore;
 import io.cascadestore.lsm.memtable.MemTable;
+import io.cascadestore.lsm.metrics.AmplificationSnapshot;
 import io.cascadestore.lsm.metrics.CascadeMetrics;
 import io.cascadestore.lsm.metrics.PrometheusHttpServer;
 import io.cascadestore.lsm.sstable.SSTable;
@@ -212,7 +213,8 @@ public class CascadeStore implements Storage {
 
     deleteStore = new DeleteStore(activeMemTable, memTableLock, wal, recovering, getStore);
 
-    mergeStore = new MergeStore(activeMemTable, memTableLock, wal, recovering, getStore);
+    mergeStore =
+        new MergeStore(activeMemTable, memTableLock, wal, recovering, getStore, metrics);
 
     publishStorageLayout();
 
@@ -508,7 +510,8 @@ public class CascadeStore implements Storage {
       getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
       putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
       deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
-      mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+      mergeStore.updateDependencies(
+          activeMemTable, memTableLock, wal, recovering, getStore, metrics);
 
       try {
         wal.sync();
@@ -577,7 +580,8 @@ public class CascadeStore implements Storage {
         return false;
       }
       switchMemTable();
-      mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+      mergeStore.updateDependencies(
+          activeMemTable, memTableLock, wal, recovering, getStore, metrics);
     }
     return false;
   }
@@ -754,7 +758,8 @@ public class CascadeStore implements Storage {
     getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
     putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
     deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
-    mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+    mergeStore.updateDependencies(
+        activeMemTable, memTableLock, wal, recovering, getStore, metrics);
     publishStorageLayout();
 
     logger.info("CascadeStore cleared");
@@ -813,6 +818,21 @@ public class CascadeStore implements Storage {
     }
   }
 
+  /** Sum of live SSTable data-file bytes (engine-reported, not filesystem du). */
+  public long liveSstableDataBytes() {
+    synchronized (ssTables) {
+      long total = 0L;
+      for (SSTable ssTable : ssTables) {
+        total += ssTable.getDataFileSizeBytes();
+      }
+      return total;
+    }
+  }
+
+  public AmplificationSnapshot amplificationSnapshot() {
+    return metrics.snapshot(liveSstableDataBytes(), getSSTablesCount());
+  }
+
   public void flushMemTables() {
     if (logger.isDebugEnabled()) {
       synchronized (immutableMemTables) {
@@ -860,7 +880,8 @@ public class CascadeStore implements Storage {
       getStore.updateDependencies(activeMemTable, storageVersion, memTableLock);
       putStore.updateDependencies(activeMemTable, memTableLock, wal, recovering);
       deleteStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
-      mergeStore.updateDependencies(activeMemTable, memTableLock, wal, recovering, getStore);
+      mergeStore.updateDependencies(
+          activeMemTable, memTableLock, wal, recovering, getStore, metrics);
 
       try {
         wal.sync();
