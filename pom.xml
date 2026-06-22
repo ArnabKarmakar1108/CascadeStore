@@ -120,6 +120,14 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- LevelDB JNI for YCSB comparison harness -->
+        <dependency>
+            <groupId>org.fusesource.leveldbjni</groupId>
+            <artifactId>leveldbjni-all</artifactId>
+            <version>1.8</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- LZ4 compression for SSTable values -->
         <dependency>
             <groupId>org.lz4</groupId>

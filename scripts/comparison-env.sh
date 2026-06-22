@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared comparison profile for CascadeStore vs RocksDB YCSB runs.
 #
-# Compaction-stress settings (see benchmark/BENCHMARKS.md):
+# Compaction-stress settings (see benchmark/comparison/RESULTS.md):
 #   64 MB memtable, L0 threshold 2, frequent flush/compaction attempts.
 
 set -euo pipefail

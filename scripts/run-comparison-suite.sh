@@ -22,4 +22,4 @@ echo ""
 "${SCRIPT_DIR}/run-comparison-rocksdb-stress.sh"
 
 echo ""
-echo "Comparison suite complete. See benchmark/COMPARISON.md for reporting guidance."
+echo "Comparison suite complete. See benchmark/comparison/RESULTS.md for reporting guidance."
