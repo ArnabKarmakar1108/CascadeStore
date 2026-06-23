@@ -23,8 +23,20 @@ ensure_ycsb_checkout() {
 }
 
 ensure_built() {
-  if [[ ! -f "${PROJECT_ROOT}/target/cascade-store-1.0-SNAPSHOT-tests.jar" ]]; then
+  local test_jar="${PROJECT_ROOT}/target/cascade-store-1.0-SNAPSHOT-tests.jar"
+  local main_jar="${PROJECT_ROOT}/target/cascade-store-1.0-SNAPSHOT.jar"
+  if [[ ! -f "${test_jar}" || ! -f "${main_jar}" ]]; then
     echo "Building CascadeStore (package + test-jar)..."
+    (cd "${PROJECT_ROOT}" && mvn -q -DskipTests package)
+    return
+  fi
+
+  local newest_source
+  newest_source="$(find "${PROJECT_ROOT}/src" -type f \( -name '*.java' -o -name '*.properties' \) -printf '%T@\n' 2>/dev/null | sort -n | tail -1)"
+  local jar_mtime
+  jar_mtime="$(stat -c '%Y' "${test_jar}" 2>/dev/null || echo 0)"
+  if [[ -n "${newest_source}" && "$(printf '%.0f' "${newest_source}")" -gt "${jar_mtime}" ]]; then
+    echo "Rebuilding CascadeStore (sources newer than test jar)..."
     (cd "${PROJECT_ROOT}" && mvn -q -DskipTests package)
   fi
 }

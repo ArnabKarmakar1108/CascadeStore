@@ -25,10 +25,13 @@ public final class CascadeStoreYcsbFactory {
   public static final String PROP_SHARDS = "cascadestore.shards";
   /** Per-shard block cache size in MiB; 0 disables. Omit to auto-scale by shard count. */
   public static final String PROP_BLOCK_CACHE_MB = "cascadestore.block.cache.mb";
+  /** When true (default), enable Prometheus counters for amplification snapshots in result files. */
+  public static final String PROP_METRICS_ENABLED = "cascadestore.metrics.enabled";
+  public static final String PROP_SSTABLE_LZ4_ENABLED = "cascadestore.sstable.lz4.enabled";
 
   private CascadeStoreYcsbFactory() {}
 
-  /** Example properties matching {@code YCSB_BENCHMARK_PLAN.md}. */
+  /** Example properties matching the YCSB binding defaults. */
   public static Properties exampleProperties() {
     Properties properties = new Properties();
     properties.setProperty(PROP_DATADIR, "/tmp/ycsb-cascade-data");

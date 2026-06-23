@@ -107,6 +107,12 @@ run_phase() {
   if [[ -n "${BLOCK_CACHE_MB}" ]]; then
     extra_props+=("-p" "cascadestore.block.cache.mb=${BLOCK_CACHE_MB}")
   fi
+  if [[ -n "${METRICS_ENABLED:-}" ]]; then
+    extra_props+=("-p" "cascadestore.metrics.enabled=${METRICS_ENABLED}")
+  fi
+  if [[ -n "${SSTABLE_LZ4_ENABLED:-}" ]]; then
+    extra_props+=("-p" "cascadestore.sstable.lz4.enabled=${SSTABLE_LZ4_ENABLED}")
+  fi
 
   java ${YCSB_JVM_OPTS} -cp "${YCSB_CP}" site.ycsb.Client "${ycsb_flag}" \
     -db "${DB_CLASS}" \

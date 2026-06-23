@@ -6,6 +6,7 @@ import io.cascadestore.lsm.config.CascadeConfig;
 import io.cascadestore.lsm.core.compaction.CompactionStrategyType;
 import io.cascadestore.lsm.core.store.CascadeStore;
 import io.cascadestore.lsm.io.BlockCache;
+import io.cascadestore.lsm.metrics.AmplificationSnapshot;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -82,6 +83,12 @@ public class CascadeStoreYcsbClient extends DB {
             CascadeStoreYcsbFactory.PROP_BLOCK_CACHE_MB,
             BlockCache.DEFAULT_SIZE_BYTES,
             shardCount);
+    boolean metricsEnabled =
+        Boolean.parseBoolean(
+            props.getProperty(CascadeStoreYcsbFactory.PROP_METRICS_ENABLED, "false"));
+    boolean sstableLz4Enabled =
+        Boolean.parseBoolean(
+            props.getProperty(CascadeStoreYcsbFactory.PROP_SSTABLE_LZ4_ENABLED, "false"));
 
     baseRegistryKey =
         buildRegistryKey(
@@ -112,16 +119,19 @@ public class CascadeStoreYcsbClient extends DB {
         String shardRegistryKey = shardRegistryKey(baseRegistryKey, shard);
         CascadeConfig config =
             new CascadeConfig(
-                memTableMb * 1024 * 1024,
-                shardDir.toString(),
-                compactionThreshold,
-                compactionIntervalMinutes,
-                cleanupIntervalMinutes,
-                flushIntervalSeconds,
-                strategyType,
-                blockCacheBytes,
-                true,
-                3);
+                    memTableMb * 1024 * 1024,
+                    shardDir.toString(),
+                    compactionThreshold,
+                    compactionIntervalMinutes,
+                    cleanupIntervalMinutes,
+                    flushIntervalSeconds,
+                    strategyType,
+                    blockCacheBytes,
+                    true,
+                    3)
+                .withMetricsEnabled(metricsEnabled)
+                .withMetricsPort(0)
+                .withSstableLz4Enabled(sstableLz4Enabled);
         shards[shard] =
             SharedCascadeStoreRegistry.acquire(shardRegistryKey, () -> new CascadeStore(config));
         shardRegistryKeys.add(shardRegistryKey);
@@ -131,6 +141,13 @@ public class CascadeStoreYcsbClient extends DB {
 
   @Override
   public void cleanup() throws DBException {
+    if (shards != null) {
+      AmplificationSnapshot total = AmplificationSnapshot.EMPTY;
+      for (CascadeStore shard : shards) {
+        total = total.plus(shard.amplificationSnapshot());
+      }
+      YcsbAmplificationReporter.printSnapshot(System.out, total);
+    }
     if (shardRegistryKeys != null) {
       for (String shardRegistryKey : shardRegistryKeys) {
         SharedCascadeStoreRegistry.release(shardRegistryKey);
