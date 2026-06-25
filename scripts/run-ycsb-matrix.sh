@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the strategy × workload YCSB matrix from YCSB_BENCHMARK_PLAN.md.
+# Run a strategy × workload YCSB matrix (ad-hoc exploration).
 #
 # Usage:
 #   ./scripts/run-ycsb-matrix.sh workloada-dryrun          # dry-run matrix (small)
