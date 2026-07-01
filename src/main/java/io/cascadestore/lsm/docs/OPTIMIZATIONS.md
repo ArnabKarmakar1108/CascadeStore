@@ -338,7 +338,7 @@ At 1M scale with 4 YCSB threads per shard, this produced **~124 ms p99** read la
 
 1M THRESHOLD (4 shards × 4 threads, cache off): run **3,247 ops/s** (was **1,328 ops/s**), read p99 **116 µs** (was **124 ms**). Zero errors.
 
-**See also:** `PERFORMANCE_OPTIMIZATION_PLAN.md` Phase A; `DATA_FLOW.md`.
+**See also:** `DATA_FLOW.md` (WAL replay path).
 
 ---
 
@@ -370,7 +370,7 @@ Half of all operations performed **two** full tree traversals (read path + write
 
 Halves LSM traversals on the update half of Workload A. Combined with §13, contributed to the **~2.4×** run-throughput gain at 1M before Phase F (1,328 → 3,247 ops/s). Phase F (§17) added **~3–5×** on top of v2 matrix numbers at trial 1.
 
-**See also:** `PERFORMANCE_OPTIMIZATION_PLAN.md` Phase D; `api/ValueMerger.java`.
+**See also:** `api/ValueMerger.java`; `DATA_FLOW.md`.
 
 ---
 
@@ -408,7 +408,7 @@ Row cache was removed — it invalidated on every update (50% of Workload A) and
 
 Optional; not required for the 1M correctness/throughput gate. Use as a profiling-driven knob, not a default at 4-shard scale.
 
-**See also:** `BlockCacheTest`; `PERFORMANCE_OPTIMIZATION_PLAN.md` Phase B1.
+**See also:** `BlockCacheTest`; `ARCHITECTURE.md`.
 
 ---
 
@@ -441,9 +441,9 @@ Columnar / field-level storage (F2d), delta WAL (F2e), off-heap block cache (F6d
 
 ### Benchmark note
 
-Report **trial 1** when comparing releases; later trials in a back-to-back matrix run faster due to cumulative JVM/OS warmth (see `BENCHMARKS.md` Phase F section).
+Report **trial 1** when comparing releases; later trials in a back-to-back matrix run faster due to cumulative JVM/OS warmth.
 
-**See also:** `PERFORMANCE_OPTIMIZATION_PLAN.md` §15; `benchmark/BENCHMARKS.md` Workload A @ 1M Phase F.
+**See also:** `benchmark/throughput-by-scale/RESULTS.md` for headline throughput numbers.
 
 ---
 
