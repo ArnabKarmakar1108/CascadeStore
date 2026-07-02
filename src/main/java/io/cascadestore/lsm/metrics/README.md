@@ -32,21 +32,19 @@ curl -s http://localhost:9090/metrics | grep cascadestore_
 
 **Browser dashboard (humans):** open [http://localhost:9090/](http://localhost:9090/) — grouped cards, auto-refresh every 2s.
 
+![CascadeStore metrics dashboard](dashboard.png)
+
 `/metrics` is intentionally plain text (Prometheus scrape format). Use `/` for a readable UI.
 
-### Demo workload (keeps running)
+### Observe under load
 
-```bash
-./scripts/run-metrics-demo.sh
-```
-
-In another terminal:
+Enable metrics in config, run any YCSB workload, then scrape or open the dashboard:
 
 ```bash
 curl -s http://localhost:9090/metrics | grep cascadestore_
 ```
 
-Stop the demo with `Ctrl+C`.
+See the [dashboard screenshot](dashboard.png) above for the browser UI.
 
 ## Configuration
 
