@@ -50,18 +50,20 @@ Helper scripts in `scripts/` set up the YCSB checkout, classpath, and JVM flags:
 
 ```bash
 # Smoke test (1k records)
-./scripts/run-ycsb.sh workloada-dryrun
+./scripts/run-ycsb.sh all workloada-dryrun LEVEL_TIERED
 
-# Standard scale ladder (10k + 100k)
-./scripts/run-ycsb-scale-ladder.sh
-
-# Full strategy matrix @ 100k
+# Single workload @ custom scale
 THREADS=1 MEMTABLE_MB=256 RECORDCOUNT=100000 OPERATIONCOUNT=100000 \
-  ./scripts/run-ycsb-matrix.sh matrix
+  ./scripts/run-ycsb-matrix.sh workloada 100000 100000
 
-# 1M comparison (example)
-THREADS=1 MEMTABLE_MB=256 COMPACTION_THRESHOLD=4 RECORDCOUNT=1000000 OPERATIONCOUNT=1000000 \
-  ./scripts/run-ycsb-matrix.sh workloada 1000000 1000000
+# Strategy comparison (read / write / space amplification)
+./scripts/run-strategy-comparison.sh read    # or write | space | all
+
+# Engine comparison @ 250k
+COMPARISON_SCALE=250000 ./scripts/run-comparison-suite.sh
+
+# Scaling matrix (scale × shards × threads)
+./scripts/run-scaling-matrix.sh
 ```
 
 Common environment variables (see `scripts/ycsb-env.sh` and `scripts/run-ycsb.sh`):
@@ -73,6 +75,9 @@ Common environment variables (see `scripts/ycsb-env.sh` and `scripts/run-ycsb.sh
 | `MEMTABLE_MB` | MemTable size per shard |
 | `COMPACTION_THRESHOLD` | SSTable count trigger |
 | `BLOCK_CACHE_MB` | Per-shard block cache; `0` disables |
+| `SSTABLE_LZ4_ENABLED` | LZ4 compression on SSTable data blocks |
+| `METRICS_ENABLED` | Prometheus `/metrics` and browser dashboard |
+| `COMPACTION_INTERVAL_MINUTES` | Background compaction cadence |
 | `TRIALS` / `WARMUP_SECONDS` | Matrix repeat count and per-trial JVM warmup |
 
 Raw output lands in `benchmark/results/`. Summarize a run:
@@ -81,7 +86,7 @@ Raw output lands in `benchmark/results/`. Summarize a run:
 ./scripts/collect-ycsb-metrics.sh benchmark/results/workloada-THRESHOLD-run-*.txt
 ```
 
-Recorded results and comparison tables: [benchmark/BENCHMARKS.md](../../../../../../../benchmark/BENCHMARKS.md).
+Recorded results and comparison tables: [benchmark/README.md](../../../../../../../benchmark/README.md).
 
 ## Interpreting Results
 
