@@ -5,6 +5,7 @@ import io.prometheus.client.CollectorRegistry;
 import io.prometheus.client.exporter.HTTPServer;
 import io.prometheus.client.hotspot.DefaultExports;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.concurrent.Executors;
 import org.slf4j.Logger;
@@ -32,7 +33,8 @@ public final class PrometheusHttpServer implements AutoCloseable {
   public PrometheusHttpServer(int port, CollectorRegistry registry) throws IOException {
     DefaultExports.initialize();
 
-    httpServer = HttpServer.create(new InetSocketAddress(port), 0);
+    InetSocketAddress bindAddress = bindAddress(port);
+    httpServer = HttpServer.create(bindAddress, 0);
     httpServer.createContext("/metrics", new HTTPServer.HTTPMetricHandler(registry));
     httpServer.createContext("/metrics-icon.png", new MetricsAssetHandler("metrics-icon.png", "image/png"));
     httpServer.createContext("/", new MetricsDashboardHandler());
@@ -58,5 +60,13 @@ public final class PrometheusHttpServer implements AutoCloseable {
   public void close() {
     httpServer.stop(0);
     logger.info("Prometheus metrics server stopped");
+  }
+
+  private static InetSocketAddress bindAddress(int port) throws IOException {
+    if (port == 0) {
+      // Let the OS pick a free port on IPv4 loopback (matches scrape URLs in tests/CI).
+      return new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0);
+    }
+    return new InetSocketAddress(port);
   }
 }

@@ -119,3 +119,14 @@ buildNumber.properties
 
 # Local benchmark / demo data directories
 data/
+
+# Python bytecode from benchmark plot scripts
+__pycache__/
+*.py[cod]
+
+# Raw YCSB run logs (published CSVs/plots live under benchmark/*/)
+benchmark/results/*
+!benchmark/results/.gitignore
+
+# Local CI / debug logs
+**/build_failure*.txt
