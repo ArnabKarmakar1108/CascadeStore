@@ -2,6 +2,8 @@
 
 CascadeStore is a Java 17 LSM-tree key-value engine. Writes are buffered in an ordered in-memory table, made durable through a write-ahead log, and eventually flushed into immutable on-disk SSTables. Off-heap value storage, bloom filters, and optional block caching keep heap churn low while reads stay predictable as data grows.
 
+**Read the full write-up on Medium:** [Building CascadeStore — a Java LSM engine](https://medium.com/@arnabk1108/building-cascadestore-a-java-lsm-engine-eb45edefa17e?postPublishedType=initial)
+
 ## Contents
 
 - [What it does](#what-it-does)
@@ -17,13 +19,15 @@ CascadeStore is a Java 17 LSM-tree key-value engine. Writes are buffered in an o
 
 The engine follows the standard LSM lifecycle: mutations land in a mutable MemTable and WAL, immutable MemTables flush to level-0 SSTables, and background compaction rewrites overlapping files so read amplification stays bounded. The design targets write-heavy and mixed workloads—event ingestion, caching layers, and append-oriented storage—where sequential disk I/O and batched durability matter.
 
-| Layer | Role |
-|-------|------|
-| **MemTable** | Concurrent skip-list index with off-heap value payloads |
-| **WAL** | Append-only recovery log with batched `fsync` and MANIFEST checkpointing |
-| **SSTable** | Sorted data files with sparse indexes and bloom filters |
-| **Background services** | Flush, compaction (three strategies), and TTL cleanup |
-| **Metrics** | Optional Prometheus scrape endpoint and browser dashboard |
+
+| Layer                   | Role                                                                     |
+| ----------------------- | ------------------------------------------------------------------------ |
+| **MemTable**            | Concurrent skip-list index with off-heap value payloads                  |
+| **WAL**                 | Append-only recovery log with batched `fsync` and MANIFEST checkpointing |
+| **SSTable**             | Sorted data files with sparse indexes and bloom filters                  |
+| **Background services** | Flush, compaction (three strategies), and TTL cleanup                    |
+| **Metrics**             | Optional Prometheus scrape endpoint and browser dashboard                |
+
 
 ## Capabilities
 
@@ -66,16 +70,18 @@ Range scans, TTL puts, and iterators are supported — see [core/README.md](src/
 
 `CascadeConfig` centralizes knobs you set before opening a store:
 
-| Knob | Default / typical | Effect |
-|------|-------------------|--------|
-| MemTable size | 10 MB – 256 MB | Flush frequency, ingest burst capacity |
-| Compaction threshold | 4 SSTables | When background compaction triggers |
-| Compaction strategy | `THRESHOLD` | Write vs read amplification trade-off |
-| Block cache | 128 MB (`0` = off) | Hot block reuse on repeated reads |
-| SSTable LZ4 | off | On-disk compression for data blocks |
-| Parallel bloom | on (≥3 SSTables) | Multi-threaded bloom probes on wide reads |
-| Metrics | off | Prometheus `/metrics` + dashboard on configurable port |
-| Flush / compaction / TTL intervals | config fields | Background service cadence |
+
+| Knob                               | Default / typical  | Effect                                                 |
+| ---------------------------------- | ------------------ | ------------------------------------------------------ |
+| MemTable size                      | 10 MB – 256 MB     | Flush frequency, ingest burst capacity                 |
+| Compaction threshold               | 4 SSTables         | When background compaction triggers                    |
+| Compaction strategy                | `THRESHOLD`        | Write vs read amplification trade-off                  |
+| Block cache                        | 128 MB (`0` = off) | Hot block reuse on repeated reads                      |
+| SSTable LZ4                        | off                | On-disk compression for data blocks                    |
+| Parallel bloom                     | on (≥3 SSTables)   | Multi-threaded bloom probes on wide reads              |
+| Metrics                            | off                | Prometheus `/metrics` + dashboard on configurable port |
+| Flush / compaction / TTL intervals | config fields      | Background service cadence                             |
+
 
 ```java
 CascadeConfig config = new CascadeConfig(
@@ -91,10 +97,11 @@ CascadeConfig config = new CascadeConfig(
 Storage store = new CascadeStore(config);
 ```
 
-| Strategy | Best for |
-|----------|----------|
-| `THRESHOLD` | Simple default; compacts the busiest level |
-| `SIZE_TIERED` | Sustained bulk ingest; lower write amplification |
+
+| Strategy       | Best for                                          |
+| -------------- | ------------------------------------------------- |
+| `THRESHOLD`    | Simple default; compacts the busiest level        |
+| `SIZE_TIERED`  | Sustained bulk ingest; lower write amplification  |
 | `LEVEL_TIERED` | Read-heavy steady state; lower read amplification |
 
 ## Architecture
@@ -162,10 +169,10 @@ flowchart TB
 
 Enable metrics on `CascadeConfig` (`withMetricsEnabled(true)`, default port 9090):
 
-- **`GET /metrics`** — Prometheus text exposition (throughput counters, amplification, flush/compaction histograms, block-cache hit rate, WAL fsync latency)
-- **`GET /`** — live browser dashboard with grouped cards and auto-refresh
+- `GET /metrics` — Prometheus text exposition (throughput counters, amplification, flush/compaction histograms, block-cache hit rate, WAL fsync latency)
+- `GET /` — live browser dashboard with grouped cards and auto-refresh
 
-![Metrics dashboard](src/main/java/io/cascadestore/lsm/metrics/dashboard.png)
+Metrics dashboard
 
 ```bash
 curl -s http://localhost:9090/metrics | grep cascadestore_
@@ -179,11 +186,11 @@ YCSB macrobenchmarks are published under [benchmark/](benchmark/README.md). Head
 
 **Throughput vs dataset size** — separate tuned runs per workload; throughput rises through mid-scale, then dips slightly at 1M as the LSM deepens.
 
-![Throughput vs scale](benchmark/throughput-by-scale/plots/throughput_vs_scale.png)
+Throughput vs scale
 
 **Compaction strategy — read throughput (Workload C)** — level-tiered leads on pure reads under a frozen-compaction read track.
 
-![Read throughput by strategy](benchmark/strategy-comparison/plots/read_throughput_vs_scale.png)
+Read throughput by strategy
 
 More suites: [strategy comparison](benchmark/strategy-comparison/) · [vs RocksDB / LevelDB](benchmark/comparison/) · [scaling matrix](benchmark/scaling-matrix/) · [throughput by scale](benchmark/throughput-by-scale/)
 
@@ -191,12 +198,14 @@ Microbenchmarks (JMH) and the YCSB harness: [src/test/java/io/cascadestore/lsm/b
 
 ## Further reading
 
-| Document | Contents |
-|----------|----------|
-| [ARCHITECTURE.md](src/main/java/io/cascadestore/lsm/docs/ARCHITECTURE.md) | Write/read/recovery paths in depth |
-| [DATA_FLOW.md](src/main/java/io/cascadestore/lsm/docs/DATA_FLOW.md) | End-to-end data movement |
-| [OPTIMIZATIONS.md](src/main/java/io/cascadestore/lsm/docs/OPTIMIZATIONS.md) | Implemented performance work |
-| [core/](src/main/java/io/cascadestore/lsm/core/README.md) · [memtable/](src/main/java/io/cascadestore/lsm/memtable/README.md) · [sstable/](src/main/java/io/cascadestore/lsm/sstable/README.md) · [wal/](src/main/java/io/cascadestore/lsm/wal/README.md) | Package-level notes |
+
+| Document                                                                                                                                                                                                                                                  | Contents                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| [ARCHITECTURE.md](src/main/java/io/cascadestore/lsm/docs/ARCHITECTURE.md)                                                                                                                                                                                 | Write/read/recovery paths in depth |
+| [DATA_FLOW.md](src/main/java/io/cascadestore/lsm/docs/DATA_FLOW.md)                                                                                                                                                                                       | End-to-end data movement           |
+| [OPTIMIZATIONS.md](src/main/java/io/cascadestore/lsm/docs/OPTIMIZATIONS.md)                                                                                                                                                                               | Implemented performance work       |
+| [core/](src/main/java/io/cascadestore/lsm/core/README.md) · [memtable/](src/main/java/io/cascadestore/lsm/memtable/README.md) · [sstable/](src/main/java/io/cascadestore/lsm/sstable/README.md) · [wal/](src/main/java/io/cascadestore/lsm/wal/README.md) | Package-level notes                |
+
 
 ---
 
